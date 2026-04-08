@@ -1,0 +1,564 @@
+# CODEX BUILD PROMPT — CodeLens AI: Developer Productivity Platform
+## Hackathon: Developer Tools — Engineering Productivity
+
+---
+
+## PROJECT OVERVIEW
+
+Build **CodeLens AI** — a full-stack web application that helps new developers understand an unfamiliar codebase instantly, diagnose production errors semantically, and auto-fix bugs in a sandboxed closed loop.
+
+The app has 4 core modules:
+1. **Codebase Ingestion & Embedding** — Upload a ZIP or provide a GitHub URL → parse all files → build text embeddings
+2. **Interactive Dependency Map** — Visual graph showing files, functions, classes, and their dependencies
+3. **Semantic Error Diagnosis** — Paste a production error → find the responsible files using embedding similarity
+4. **Closed-Loop Auto-Fix Sandbox** — Clone repo → simulate deploy → read error → generate fix → apply → retry automatically
+5. **BONUS: Chat with Codebase** — Ask natural language questions about the code using the same embeddings
+
+---
+
+## TECH STACK
+
+```
+Frontend:  React + Vite + TailwindCSS
+Backend:   Node.js + Express (or Python FastAPI — pick one and stay consistent)
+Database:  Supabase (PostgreSQL + pgvector for embeddings)
+AI:        OpenAI API (text-embedding-3-small for embeddings, gpt-4o for fixes)
+Graph:     React Flow (npm install reactflow) for the dependency visualization
+Sandbox:   Node.js child_process or Docker (simple shell execution)
+Auth:      None needed for hackathon — skip to save time
+```
+
+---
+
+## SETUP INSTRUCTIONS FOR CODEX
+
+### Step 1 — Project Scaffold
+
+Create the following folder structure:
+
+```
+codelens-ai/
+├── frontend/          # React + Vite app
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── FileUpload.jsx
+│   │   │   ├── DependencyMap.jsx
+│   │   │   ├── ErrorDiagnoser.jsx
+│   │   │   ├── SandboxRunner.jsx
+│   │   │   └── ChatPanel.jsx
+│   │   ├── App.jsx
+│   │   └── main.jsx
+│   └── package.json
+├── backend/           # Express API
+│   ├── routes/
+│   │   ├── ingest.js        # File upload + GitHub clone
+│   │   ├── embed.js         # Build embeddings
+│   │   ├── map.js           # Dependency graph generation
+│   │   ├── diagnose.js      # Error → file matching
+│   │   ├── sandbox.js       # Closed-loop auto-fix
+│   │   └── chat.js          # Chat with codebase
+│   ├── utils/
+│   │   ├── parser.js        # AST parsing for functions/classes
+│   │   ├── embedder.js      # OpenAI embedding calls
+│   │   └── supabase.js      # DB client
+│   ├── index.js
+│   └── package.json
+└── .env
+```
+
+Run these commands to scaffold:
+```bash
+# Backend
+mkdir codelens-ai && cd codelens-ai
+mkdir backend && cd backend
+npm init -y
+npm install express cors multer dotenv openai @supabase/supabase-js simple-git archiver unzipper @babel/parser glob
+
+# Frontend
+cd ..
+npm create vite@latest frontend -- --template react
+cd frontend
+npm install
+npm install reactflow axios tailwindcss @tailwindcss/vite
+```
+
+---
+
+### Step 2 — Environment Variables
+
+Create `backend/.env` with the following keys. Tell the user to fill these in:
+
+```env
+# OpenAI — get from https://platform.openai.com/api-keys
+OPENAI_API_KEY=sk-...
+
+# Supabase — get from https://supabase.com → New Project → Settings → API
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_KEY=your-service-role-key
+
+# App
+PORT=3001
+GITHUB_TOKEN=ghp_...   # Optional: for private repos — github.com/settings/tokens
+```
+
+Create `frontend/.env`:
+```env
+VITE_API_URL=http://localhost:3001
+```
+
+---
+
+### Step 3 — Supabase Database Setup
+
+In Supabase SQL editor, run this schema:
+
+```sql
+-- Enable pgvector
+create extension if not exists vector;
+
+-- Store each parsed code chunk with its embedding
+create table code_chunks (
+  id uuid primary key default gen_random_uuid(),
+  project_id text not null,
+  file_path text not null,
+  chunk_type text,           -- 'function', 'class', 'import', 'file'
+  chunk_name text,
+  code_text text not null,
+  embedding vector(1536),    -- OpenAI text-embedding-3-small dimension
+  metadata jsonb,            -- { dependencies: [], line_start: N, line_end: N }
+  created_at timestamptz default now()
+);
+
+-- Index for fast similarity search
+create index on code_chunks using ivfflat (embedding vector_cosine_ops);
+
+-- Store projects
+create table projects (
+  id text primary key,
+  name text,
+  source text,               -- 'upload' or 'github'
+  file_count int,
+  created_at timestamptz default now()
+);
+```
+
+---
+
+## MODULE 1: CODEBASE INGESTION (`backend/routes/ingest.js`)
+
+**What it does:** Accept either a ZIP file upload OR a GitHub repo URL. Extract/clone the files. Store all file paths and content. Trigger the embedding pipeline.
+
+**Implementation instructions:**
+
+```
+1. Create a POST /api/ingest endpoint with two modes:
+   - Mode A (ZIP): Use multer to accept file upload. Use 'unzipper' to extract to /tmp/{projectId}/
+   - Mode B (GitHub): Accept { repoUrl, branch } in request body.
+     Use 'simple-git' to clone: git.clone(repoUrl, '/tmp/{projectId}', ['--depth', '1', '--branch', branch])
+
+2. After files are on disk:
+   - Use 'glob' to find all code files matching: **/*.{js,ts,py,java,go,cpp,c,rb,rs,php,jsx,tsx,vue}
+   - Ignore: node_modules/, .git/, dist/, build/, __pycache__/
+   - For each file, read its content (fs.readFile)
+   - Save to a files[] array: { filePath, content, language }
+
+3. Generate a projectId = nanoid() or timestamp string
+
+4. Insert project record into Supabase projects table
+
+5. Call the embed pipeline (Module 2) with the files array
+
+6. Return { projectId, fileCount, status: 'processing' } to frontend
+```
+
+---
+
+## MODULE 2: EMBEDDING PIPELINE (`backend/utils/embedder.js` + `backend/routes/embed.js`)
+
+**What it does:** Parse each file into meaningful chunks (functions, classes, imports). Convert each chunk to a vector embedding using OpenAI. Store in Supabase with pgvector.
+
+**Implementation instructions:**
+
+```
+1. PARSING — In parser.js:
+   For JavaScript/TypeScript files:
+     - Use @babel/parser to parse the AST
+     - Extract: FunctionDeclaration, ArrowFunctionExpression, ClassDeclaration
+     - For each, capture: name, full code text, start line, end line
+     - Also extract all import statements to build dependency list
+   
+   For Python files:
+     - Use simple regex patterns to find: def functionName, class ClassName
+     - Extract the block (lines until next definition at same indent level)
+   
+   For other languages:
+     - Fall back to chunking by 50-line sliding window with 10-line overlap
+
+2. EMBEDDING — In embedder.js:
+   - For each chunk, call OpenAI:
+     const response = await openai.embeddings.create({
+       model: 'text-embedding-3-small',
+       input: chunk.codeText
+     });
+     const vector = response.data[0].embedding;
+   
+   - IMPORTANT: Batch calls in groups of 20 to avoid rate limits
+   - Add 500ms delay between batches
+
+3. STORAGE — Insert each chunk into Supabase code_chunks table:
+   {
+     project_id: projectId,
+     file_path: chunk.filePath,
+     chunk_type: chunk.type,       // 'function', 'class', 'import'
+     chunk_name: chunk.name,
+     code_text: chunk.codeText,
+     embedding: vector,
+     metadata: {
+       dependencies: chunk.imports,   // files this chunk imports
+       line_start: chunk.lineStart,
+       line_end: chunk.lineEnd,
+       language: chunk.language
+     }
+   }
+
+4. After all chunks are stored, call the map builder (Module 3)
+```
+
+---
+
+## MODULE 3: DEPENDENCY MAP (`backend/routes/map.js` + `frontend/src/components/DependencyMap.jsx`)
+
+**What it does:** Build a graph of files and their relationships. Render it as an interactive visual using React Flow.
+
+**Backend instructions:**
+
+```
+1. Create GET /api/map/:projectId endpoint
+
+2. Query all code_chunks for the project, grouped by file_path
+
+3. Build a graph data structure:
+   nodes = unique files → { id: filePath, label: fileName, type: fileType, chunkCount: N }
+   edges = import relationships → { source: importingFile, target: importedFile }
+
+4. To find edges:
+   - For each chunk, look at metadata.dependencies (the imports array)
+   - Resolve relative imports to absolute file paths
+   - Create an edge from chunk.file_path → resolved import path
+
+5. Return { nodes, edges, stats: { totalFiles, totalFunctions, totalClasses } }
+```
+
+**Frontend instructions (DependencyMap.jsx):**
+
+```
+1. Use ReactFlow to render the graph:
+   import ReactFlow, { Background, Controls, MiniMap } from 'reactflow'
+
+2. Style nodes by file type:
+   - .js/.ts files → blue nodes
+   - .py files → yellow nodes
+   - config files → gray nodes
+   - Entry points (index.js, main.py) → larger, highlighted
+
+3. On node click → show a right sidebar with:
+   - File path
+   - List of functions and classes in that file
+   - List of files it imports (outgoing edges)
+   - List of files that import it (incoming edges)
+
+4. Add a search bar to highlight nodes matching a function/class name
+
+5. Layout: Use dagre layout algorithm for top-down tree layout
+   (npm install dagre)
+```
+
+---
+
+## MODULE 4: SEMANTIC ERROR DIAGNOSIS (`backend/routes/diagnose.js` + `frontend/src/components/ErrorDiagnoser.jsx`)
+
+**What it does:** User pastes a production error/stack trace. We embed it and find the most semantically similar code chunks. Return ranked list of likely culprit files and functions.
+
+**Backend instructions:**
+
+```
+1. Create POST /api/diagnose endpoint
+   Body: { projectId, errorText }
+
+2. Embed the error text using OpenAI:
+   const errorEmbedding = await openai.embeddings.create({
+     model: 'text-embedding-3-small',
+     input: errorText
+   })
+
+3. Use pgvector cosine similarity search in Supabase:
+   const { data } = await supabase.rpc('match_chunks', {
+     query_embedding: errorEmbedding.data[0].embedding,
+     project_id: projectId,
+     match_count: 10
+   })
+
+4. Add this SQL function to Supabase:
+   create or replace function match_chunks(
+     query_embedding vector(1536),
+     project_id text,
+     match_count int
+   ) returns table (
+     id uuid, file_path text, chunk_name text, chunk_type text,
+     code_text text, similarity float
+   ) language sql as $$
+     select id, file_path, chunk_name, chunk_type, code_text,
+       1 - (embedding <=> query_embedding) as similarity
+     from code_chunks
+     where code_chunks.project_id = match_chunks.project_id
+     order by embedding <=> query_embedding
+     limit match_count;
+   $$;
+
+5. Parse any file paths or line numbers from the raw stack trace text
+   using regex: /at .+ \((.+):(\d+):(\d+)\)/g
+   Boost similarity score by 0.3 if a chunk's file_path matches extracted paths
+
+6. Return top 5 results with explanation:
+   {
+     results: [
+       {
+         filePath, chunkName, chunkType, codeText,
+         similarityScore, reason: 'High semantic match to error context'
+       }
+     ]
+   }
+```
+
+**Frontend instructions:**
+
+```
+1. Show a large textarea for error paste
+2. On submit, show ranked results as cards:
+   - Similarity score as a colored bar (red = high match)
+   - File path + function name
+   - Code snippet preview with syntax highlighting (use react-syntax-highlighter)
+   - Button: "Send to Auto-Fix Sandbox"
+3. Clicking a result highlights the corresponding node on the Dependency Map
+```
+
+---
+
+## MODULE 5: CLOSED-LOOP AUTO-FIX SANDBOX (`backend/routes/sandbox.js` + `frontend/src/components/SandboxRunner.jsx`)
+
+**What it does:** Clone the repo. Run the project. Detect the error. Send error + code to GPT-4o for a fix. Apply the fix. Re-run. Repeat up to 3 times. Show the diff and final fixed code.
+
+**Backend instructions:**
+
+```
+1. Create POST /api/sandbox/run endpoint
+   Body: { projectId, repoUrl, errorText, targetFilePath, runCommand }
+   Example runCommand: "npm test" or "python main.py" or "npm start"
+
+2. SANDBOX SETUP:
+   - Clone repo to /tmp/sandbox/{projectId}/ using simple-git
+   - Run: npm install (or pip install -r requirements.txt) using child_process.exec
+
+3. LOOP (max 3 iterations):
+
+   STEP A — Run the command:
+   const { stdout, stderr } = await exec(runCommand, { cwd: sandboxDir, timeout: 30000 })
+   
+   STEP B — Check for errors:
+   if no stderr and exit code 0 → SUCCESS, break loop
+   capturedError = stderr or stdout (look for Error/Exception/Traceback)
+   
+   STEP C — Generate fix with GPT-4o:
+   Read the target file: const fileContent = fs.readFileSync(targetFilePath)
+   
+   Call OpenAI chat:
+   {
+     model: 'gpt-4o',
+     messages: [
+       { role: 'system', content: 'You are an expert debugger. Return ONLY the complete fixed file content with no explanation, no markdown, no backticks. Just the raw code.' },
+       { role: 'user', content: `
+         File: ${targetFilePath}
+         Current code:
+         ${fileContent}
+         
+         Error encountered:
+         ${capturedError}
+         
+         Fix the bug. Return only the complete corrected file.
+       `}
+     ]
+   }
+   
+   STEP D — Apply fix:
+   Write the GPT response directly to the file: fs.writeFileSync(targetFilePath, fixedCode)
+   
+   Store the diff: use 'diff' npm package to compare old vs new
+
+4. After loop ends, return:
+   {
+     success: boolean,
+     iterations: [
+       { iteration: 1, errorFound: '...', fixApplied: '...', diff: '...' },
+       ...
+     ],
+     finalCode: '...',
+     message: 'Fixed in 2 iterations' or 'Could not auto-fix after 3 attempts'
+   }
+```
+
+**Frontend instructions:**
+
+```
+1. Show a form: repo URL, run command, target file (pre-filled from error diagnosis)
+2. On run, show a live terminal-style log of each iteration:
+   - Iteration 1: ❌ Error detected → 🤖 Generating fix → ✅ Fix applied → 🔄 Retrying
+   - Iteration 2: ✅ Tests passed!
+3. Show a before/after diff view using react-diff-viewer (npm install react-diff-viewer)
+4. Show a "Download Fixed File" button
+5. Show a summary: "Bug was in line 47 of auth.js — missing null check on user object"
+   (generate this summary with a quick GPT call on the final diff)
+```
+
+---
+
+## MODULE 6 (BONUS): CHAT WITH CODEBASE (`backend/routes/chat.js` + `frontend/src/components/ChatPanel.jsx`)
+
+**What it does:** Natural language Q&A over the codebase. Uses the same embeddings already built. Zero extra embedding cost.
+
+**Backend instructions:**
+
+```
+1. Create POST /api/chat endpoint
+   Body: { projectId, message, conversationHistory }
+
+2. Embed the user's message (same as error diagnosis step)
+
+3. Retrieve top 5 most similar code chunks using match_chunks function
+
+4. Call GPT-4o with context:
+   {
+     model: 'gpt-4o',
+     messages: [
+       { role: 'system', content: `You are a codebase assistant. Answer questions about the code using only the provided context. Be concise and reference specific files and function names.
+       
+       Codebase context:
+       ${relevantChunks.map(c => `File: ${c.file_path}\nFunction: ${c.chunk_name}\n${c.code_text}`).join('\n\n')}
+       ` },
+       ...conversationHistory,
+       { role: 'user', content: message }
+     ]
+   }
+
+5. Return { answer, sourcesUsed: [{ filePath, chunkName }] }
+```
+
+**Frontend:**
+```
+Simple chat UI with:
+- Message bubbles
+- "Sources" section below each AI response showing which files were referenced
+- Suggested starter questions: "Where is authentication handled?", "What calls the database?", "Explain the payment flow"
+```
+
+---
+
+## FRONTEND APP LAYOUT (`frontend/src/App.jsx`)
+
+```
+Build a single-page app with a left sidebar for navigation and main content area.
+
+Sidebar tabs:
+  🗂️ Upload / Connect
+  🗺️ Dependency Map
+  🔴 Error Diagnosis
+  🤖 Auto-Fix Sandbox
+  💬 Chat with Code
+
+Top bar: Show project name, file count, embedding status (e.g., "1,247 chunks indexed")
+
+Color scheme: Dark theme. Background #0d1117 (GitHub dark). Accent color #58a6ff (blue).
+Use monospace font (JetBrains Mono or Fira Code) for all code displays.
+```
+
+---
+
+## API COST ESTIMATES (for hackathon judges if asked)
+
+```
+text-embedding-3-small: $0.02 per 1M tokens
+  → Typical 10k line codebase ≈ 80k tokens ≈ $0.002 per repo
+
+gpt-4o (fix generation): $2.50 per 1M input tokens
+  → Each fix attempt ≈ 2k tokens ≈ $0.005 per fix
+```
+
+Total demo cost per repo: under $0.05. Extremely cheap.
+
+---
+
+## DEMO FLOW FOR JUDGES (Script this exactly)
+
+```
+1. Open the app. Paste this GitHub URL: https://github.com/expressjs/express
+   (or any medium-sized open source repo)
+
+2. Watch the ingestion: "Parsed 847 functions across 63 files. Building embeddings..."
+
+3. Show the Dependency Map: zoom into the graph, click a node, show the sidebar
+
+4. Go to Error Diagnosis. Paste this real Express.js error:
+   "TypeError: Cannot read properties of undefined (reading 'handle')
+    at Layer.handle [as handle_request] (/app/lib/router/layer.js:95:5)"
+   
+   Show the top matches — layer.js should rank #1
+
+5. Go to Chat. Ask: "What does the Router class do and which files depend on it?"
+   Show the AI answer with file sources
+
+6. Go to Sandbox. Show the auto-fix loop animation (can be pre-recorded if live demo is risky)
+```
+
+---
+
+## COMMON MISTAKES TO AVOID
+
+- Do NOT embed entire files as one chunk — parse into functions/classes first or embeddings are useless
+- Do NOT call OpenAI embeddings one-by-one in a loop — batch them
+- Do NOT run sandbox as root — use a restricted user or just timeout kill after 30s
+- Do NOT forget CORS headers on Express — frontend will be blocked
+- DO store projectId in localStorage on frontend so refresh doesn't lose state
+- DO add a loading spinner with real status messages — judges watch the UI during processing
+
+---
+
+## BUILD ORDER (Do these in this exact sequence)
+
+```
+Day 1 Morning:   Scaffold + Supabase schema + env setup
+Day 1 Afternoon: Module 1 (Ingest) + Module 2 (Embed) — get data flowing into DB
+Day 1 Evening:   Module 3 (Dependency Map) — this is the visual wow factor
+Day 2 Morning:   Module 4 (Error Diagnosis) — semantic search is the key differentiator
+Day 2 Afternoon: Module 5 (Sandbox) — even a basic version impresses judges
+Day 2 Evening:   Module 6 (Chat) — quick to build, big impression
+Final Hour:      Polish UI, prepare demo script, deploy frontend to Vercel
+```
+
+---
+
+## DEPLOYMENT (Last 2 hours)
+
+```
+Frontend → Vercel: cd frontend && vercel --prod
+Backend  → Railway: railway up  (or render.com)
+Set all env vars in the dashboard
+Update VITE_API_URL in frontend to point to deployed backend
+```
+
+---
+
+## ONE-LINE PITCH FOR JUDGES
+
+> "CodeLens AI gives any developer an X-ray of any codebase in 60 seconds —
+>  it maps every dependency, traces any production error to its source file semantically,
+>  and autonomously patches bugs in a sandboxed loop until they're fixed."
+```

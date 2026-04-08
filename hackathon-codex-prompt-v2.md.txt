@@ -1,0 +1,1601 @@
+# CODEX BUILD PROMPT — CodeLens AI: Developer Productivity Platform
+## Hackathon: Developer Tools — Engineering Productivity
+### Version 2 — FastAPI + ChromaDB + Inngest + Premium Animated UI
+
+---
+
+## WHY THESE TECH CHOICES (Read This First)
+
+**Backend → Python FastAPI** (not Node/Express)
+Reason: All the heavy lifting here is Python-native — AST parsing, embedding libraries,
+ChromaDB, LangChain if needed. FastAPI gives async support, automatic Swagger docs,
+and is faster to write than Express for AI/ML pipelines. Do NOT use Node.js for backend.
+
+**Vector DB → ChromaDB** (not Supabase/pgvector)
+Reason: ChromaDB runs fully in-process with zero config. No cloud account needed.
+Persists to disk automatically. Has a Python client that is 3 lines to set up.
+Perfect for hackathon — works offline, no rate limits, instant.
+
+**Background Jobs → Inngest**
+Reason: Embedding a whole repo takes 30-120 seconds. Without Inngest, the HTTP request
+would time out. Inngest lets us fire-and-forget the heavy work, stream progress back
+to the frontend via events, and retry on failure automatically.
+
+**Frontend → React + Vite + Framer Motion + TailwindCSS**
+Reason: Framer Motion is the gold standard for React animations. Combined with
+ReactFlow for the graph and a dark hacker aesthetic, this will look like a
+production tool, not a hackathon project.
+
+---
+
+## PROJECT OVERVIEW
+
+Build **CodeLens AI** — a full-stack platform that gives any developer an X-ray
+of any unfamiliar codebase in under 60 seconds.
+
+### The 5 Modules:
+1. **Codebase Ingestion** — ZIP upload or GitHub URL → parse → embed → store in ChromaDB
+2. **Interactive Dependency Map** — Animated graph of files, functions, classes, imports
+3. **Semantic Error Diagnosis** — Paste error → semantic search → find culprit files
+4. **Closed-Loop Auto-Fix Sandbox** — Clone → run → detect error → GPT fix → retry loop
+5. **Chat with Codebase** — RAG chat over the indexed codebase
+
+### Inngest powers the async backbone:
+- Ingestion job (long running) → Inngest function
+- Embedding pipeline → Inngest step functions with retries
+- Sandbox loop → Inngest function with iteration steps
+
+---
+
+## COMPLETE FOLDER STRUCTURE
+
+```
+codelens-ai/
+├── backend/                        # Python FastAPI
+│   ├── main.py                     # FastAPI app entry point
+│   ├── inngest_client.py           # Inngest setup + function definitions
+│   ├── routes/
+│   │   ├── ingest.py               # POST /api/ingest
+│   │   ├── map.py                  # GET /api/map/{project_id}
+│   │   ├── diagnose.py             # POST /api/diagnose
+│   │   ├── sandbox.py              # POST /api/sandbox/run
+│   │   ├── chat.py                 # POST /api/chat
+│   │   └── status.py               # GET /api/status/{project_id}
+│   ├── services/
+│   │   ├── parser.py               # AST parsing for JS/TS/Python
+│   │   ├── embedder.py             # OpenAI embedding calls
+│   │   ├── chroma_client.py        # ChromaDB setup and queries
+│   │   ├── graph_builder.py        # Build dependency graph data
+│   │   └── sandbox_runner.py       # Clone/run/fix loop
+│   ├── models/
+│   │   └── schemas.py              # Pydantic request/response models
+│   ├── requirements.txt
+│   └── .env
+│
+├── frontend/                       # React + Vite
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── layout/
+│   │   │   │   ├── Sidebar.jsx
+│   │   │   │   ├── TopBar.jsx
+│   │   │   │   └── StatusBar.jsx
+│   │   │   ├── pages/
+│   │   │   │   ├── UploadPage.jsx
+│   │   │   │   ├── MapPage.jsx
+│   │   │   │   ├── DiagnosePage.jsx
+│   │   │   │   ├── SandboxPage.jsx
+│   │   │   │   └── ChatPage.jsx
+│   │   │   └── ui/
+│   │   │       ├── TerminalLog.jsx
+│   │   │       ├── CodeBlock.jsx
+│   │   │       ├── SimilarityCard.jsx
+│   │   │       └── ProgressRing.jsx
+│   │   ├── hooks/
+│   │   │   ├── useProjectStore.js   # Zustand store
+│   │   │   └── useSSE.js            # Server-sent events for live progress
+│   │   ├── App.jsx
+│   │   ├── main.jsx
+│   │   └── index.css
+│   ├── package.json
+│   └── .env
+│
+└── README.md
+```
+
+---
+
+## STEP 1 — BACKEND SETUP
+
+### Install Python dependencies
+
+Create `backend/requirements.txt`:
+```
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+python-dotenv==1.0.1
+openai==1.30.0
+chromadb==0.5.0
+inngest==0.4.0
+gitpython==3.1.43
+babel==2.14.0
+tree-sitter==0.21.3
+httpx==0.27.0
+aiofiles==23.2.1
+diff-match-patch==20230430
+pydantic==2.7.1
+```
+
+Install with:
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### Create `backend/.env`
+
+```env
+# OpenAI — get from: https://platform.openai.com/api-keys
+# Click "Create new secret key" → copy the sk-... value
+OPENAI_API_KEY=sk-...
+
+# Inngest — get from: https://www.inngest.com
+# Sign up free → Create App → copy both keys from the "Keys" tab
+INNGEST_EVENT_KEY=your-event-key-here
+INNGEST_SIGNING_KEY=your-signing-key-here
+
+# GitHub — optional, only for private repos
+# Get from: https://github.com/settings/tokens → Generate new token (classic)
+# Select scopes: repo (full), read:org
+GITHUB_TOKEN=ghp_...
+
+# App config
+PORT=8000
+CHROMA_PERSIST_DIR=./chroma_data     # ChromaDB saves here automatically
+SANDBOX_DIR=/tmp/codelens_sandbox
+```
+
+---
+
+## STEP 2 — CHROMADB SETUP (`backend/services/chroma_client.py`)
+
+ChromaDB needs ZERO external setup. It runs in-process and saves to disk.
+
+```python
+import chromadb
+from chromadb.config import Settings
+import os
+
+# This is all the setup needed — ChromaDB handles everything else
+client = chromadb.PersistentClient(
+    path=os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
+)
+
+def get_collection(project_id: str):
+    """Get or create a collection for a project. Each project = one collection."""
+    return client.get_or_create_collection(
+        name=f"project_{project_id}",
+        metadata={"hnsw:space": "cosine"}   # Use cosine similarity
+    )
+
+def add_chunks(project_id: str, chunks: list[dict], embeddings: list[list[float]]):
+    """
+    Store chunks with their embeddings.
+    chunks = [{ id, code_text, file_path, chunk_name, chunk_type, metadata }]
+    embeddings = list of 1536-dim float vectors
+    """
+    collection = get_collection(project_id)
+    collection.add(
+        ids=[c["id"] for c in chunks],
+        embeddings=embeddings,
+        documents=[c["code_text"] for c in chunks],
+        metadatas=[{
+            "file_path": c["file_path"],
+            "chunk_name": c["chunk_name"],
+            "chunk_type": c["chunk_type"],
+            "line_start": c["metadata"].get("line_start", 0),
+            "line_end": c["metadata"].get("line_end", 0),
+            "dependencies": str(c["metadata"].get("dependencies", [])),
+            "language": c["metadata"].get("language", "unknown")
+        } for c in chunks]
+    )
+
+def query_similar(project_id: str, query_embedding: list[float], n_results: int = 10):
+    """Find most similar chunks to a query embedding."""
+    collection = get_collection(project_id)
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=n_results,
+        include=["documents", "metadatas", "distances"]
+    )
+    return results
+
+def get_all_chunks(project_id: str):
+    """Retrieve all chunks for building the dependency graph."""
+    collection = get_collection(project_id)
+    return collection.get(include=["documents", "metadatas"])
+
+def delete_project(project_id: str):
+    """Clean up a project's data."""
+    client.delete_collection(f"project_{project_id}")
+```
+
+**Key facts about ChromaDB for Codex to understand:**
+- No Docker, no cloud, no API key needed
+- Data persists in `./chroma_data/` folder between restarts
+- Each project gets its own named collection
+- Similarity search returns distances (0=identical, 2=opposite) — convert to score = 1 - distance
+
+---
+
+## STEP 3 — INNGEST SETUP (`backend/inngest_client.py`)
+
+Inngest handles all long-running background work so HTTP requests never time out.
+
+### How to get Inngest keys:
+1. Go to https://www.inngest.com → Sign Up (free)
+2. Create a new App called "codelens-ai"
+3. Go to the Keys tab → copy "Event Key" and "Signing Key"
+4. Paste into your .env file
+
+### Setup code:
+
+```python
+import inngest
+import os
+
+# Initialize the Inngest client
+inngest_client = inngest.Inngest(
+    app_id="codelens-ai",
+    event_key=os.getenv("INNGEST_EVENT_KEY"),
+    signing_key=os.getenv("INNGEST_SIGNING_KEY"),
+    is_production=False   # Set True when deploying
+)
+
+# ─────────────────────────────────────────────────────────
+# INNGEST FUNCTION 1: Full ingestion + embedding pipeline
+# ─────────────────────────────────────────────────────────
+@inngest_client.create_function(
+    fn_id="ingest-codebase",
+    trigger=inngest.TriggerEvent(event="codelens/ingest.requested"),
+    retries=2
+)
+async def ingest_codebase(ctx: inngest.Context, step: inngest.Step):
+    data = ctx.event.data
+    project_id = data["project_id"]
+    source_path = data["source_path"]   # local path after upload/clone
+
+    # Step 1: Parse all files into chunks
+    await step.send_event("update-status", {
+        "name": "codelens/status.updated",
+        "data": {"project_id": project_id, "status": "parsing", "progress": 10}
+    })
+    chunks = await step.run("parse-files", lambda: parse_all_files(source_path, project_id))
+
+    # Step 2: Generate embeddings in batches
+    await step.send_event("update-status", {
+        "name": "codelens/status.updated",
+        "data": {"project_id": project_id, "status": "embedding", "progress": 40}
+    })
+    embeddings = await step.run("generate-embeddings", lambda: generate_all_embeddings(chunks))
+
+    # Step 3: Store in ChromaDB
+    await step.send_event("update-status", {
+        "name": "codelens/status.updated",
+        "data": {"project_id": project_id, "status": "storing", "progress": 80}
+    })
+    await step.run("store-in-chroma", lambda: store_chunks(project_id, chunks, embeddings))
+
+    # Step 4: Build dependency graph
+    graph = await step.run("build-graph", lambda: build_dependency_graph(project_id, chunks))
+
+    # Done
+    await step.send_event("complete", {
+        "name": "codelens/status.updated",
+        "data": {
+            "project_id": project_id,
+            "status": "complete",
+            "progress": 100,
+            "chunk_count": len(chunks),
+            "graph": graph
+        }
+    })
+    return {"status": "complete", "chunks": len(chunks)}
+
+
+# ─────────────────────────────────────────────────────────
+# INNGEST FUNCTION 2: Closed-loop auto-fix sandbox
+# ─────────────────────────────────────────────────────────
+@inngest_client.create_function(
+    fn_id="sandbox-autofix",
+    trigger=inngest.TriggerEvent(event="codelens/sandbox.run"),
+    retries=1,
+    timeout="10m"
+)
+async def sandbox_autofix(ctx: inngest.Context, step: inngest.Step):
+    data = ctx.event.data
+    project_id = data["project_id"]
+    repo_url = data["repo_url"]
+    run_command = data["run_command"]
+    target_file = data["target_file"]
+    max_iterations = 3
+    iterations = []
+
+    # Clone the repo
+    sandbox_path = await step.run("clone-repo", lambda: clone_repo(repo_url, project_id))
+
+    for i in range(max_iterations):
+        # Run the command
+        result = await step.run(f"run-iteration-{i}", lambda: run_command_in_sandbox(sandbox_path, run_command))
+
+        if result["success"]:
+            await step.send_event("sandbox-success", {
+                "name": "codelens/sandbox.updated",
+                "data": {"project_id": project_id, "status": "success", "iterations": iterations}
+            })
+            return {"success": True, "iterations": iterations}
+
+        # Generate fix
+        fix = await step.run(f"generate-fix-{i}", lambda: generate_fix_with_gpt(
+            sandbox_path, target_file, result["error"]
+        ))
+        iterations.append({"iteration": i+1, "error": result["error"], "fix": fix["summary"], "diff": fix["diff"]})
+
+        # Apply fix
+        await step.run(f"apply-fix-{i}", lambda: apply_fix_to_file(sandbox_path, target_file, fix["code"]))
+
+        # Emit progress
+        await step.send_event(f"sandbox-progress-{i}", {
+            "name": "codelens/sandbox.updated",
+            "data": {"project_id": project_id, "status": "iterating", "iteration": i+1, "iterations": iterations}
+        })
+
+    # Failed after max iterations
+    return {"success": False, "iterations": iterations}
+```
+
+### Register Inngest with FastAPI in `backend/main.py`:
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import inngest.fast_api
+from inngest_client import inngest_client, ingest_codebase, sandbox_autofix
+
+app = FastAPI(title="CodeLens AI")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# Register Inngest — this adds the /api/inngest endpoint automatically
+inngest.fast_api.serve(app, inngest_client, [ingest_codebase, sandbox_autofix])
+
+# Import and register all routes
+from routes import ingest, map, diagnose, sandbox, chat, status
+app.include_router(ingest.router, prefix="/api")
+app.include_router(map.router, prefix="/api")
+app.include_router(diagnose.router, prefix="/api")
+app.include_router(sandbox.router, prefix="/api")
+app.include_router(chat.router, prefix="/api")
+app.include_router(status.router, prefix="/api")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+```
+
+### Run Inngest Dev Server locally:
+```bash
+# In a separate terminal — this connects Inngest cloud to your local server
+npx inngest-cli@latest dev -u http://localhost:8000/api/inngest
+```
+
+---
+
+## MODULE 1: CODEBASE INGESTION (`backend/routes/ingest.py`)
+
+```python
+from fastapi import APIRouter, UploadFile, File, Form, BackgroundTasks
+from services.parser import parse_all_files
+import uuid, os, zipfile, shutil
+from git import Repo
+from inngest_client import inngest_client
+import aiofiles
+
+router = APIRouter()
+
+# In-memory project status store (use Redis in production)
+project_status = {}
+
+@router.post("/ingest")
+async def ingest_codebase(
+    mode: str = Form(...),           # "upload" or "github"
+    github_url: str = Form(None),
+    branch: str = Form("main"),
+    file: UploadFile = File(None)
+):
+    project_id = str(uuid.uuid4())[:8]
+    source_path = f"/tmp/codelens/{project_id}"
+    os.makedirs(source_path, exist_ok=True)
+
+    if mode == "upload" and file:
+        # Save and extract ZIP
+        zip_path = f"{source_path}/upload.zip"
+        async with aiofiles.open(zip_path, "wb") as f:
+            content = await file.read()
+            await f.write(content)
+        with zipfile.ZipFile(zip_path, "r") as z:
+            z.extractall(source_path)
+        os.remove(zip_path)
+
+    elif mode == "github" and github_url:
+        # Clone with depth=1 for speed
+        token = os.getenv("GITHUB_TOKEN", "")
+        if token:
+            # Inject token for private repos
+            auth_url = github_url.replace("https://", f"https://{token}@")
+        else:
+            auth_url = github_url
+        Repo.clone_from(auth_url, source_path, depth=1, branch=branch)
+
+    else:
+        return {"error": "Provide either a ZIP file or a GitHub URL"}
+
+    # Fire the Inngest event — this starts the background job
+    await inngest_client.send(inngest.Event(
+        name="codelens/ingest.requested",
+        data={"project_id": project_id, "source_path": source_path}
+    ))
+
+    # Save initial status
+    project_status[project_id] = {"status": "queued", "progress": 0}
+
+    return {
+        "project_id": project_id,
+        "status": "queued",
+        "message": "Ingestion started. Poll /api/status/{project_id} for progress."
+    }
+
+
+@router.get("/status/{project_id}")
+async def get_status(project_id: str):
+    """Frontend polls this every 2 seconds to show progress."""
+    status = project_status.get(project_id, {"status": "not_found"})
+    return status
+```
+
+---
+
+## MODULE 2: PARSER (`backend/services/parser.py`)
+
+```python
+"""
+Parse source files into semantic chunks: functions, classes, imports.
+Each chunk becomes one embedding in ChromaDB.
+"""
+import os, glob, re, uuid
+from pathlib import Path
+
+IGNORED_DIRS = {"node_modules", ".git", "dist", "build", "__pycache__", ".next", "venv", ".venv"}
+CODE_EXTENSIONS = {".js", ".ts", ".jsx", ".tsx", ".py", ".java", ".go", ".rb", ".cpp", ".c", ".rs", ".vue", ".php"}
+
+def parse_all_files(source_path: str, project_id: str) -> list[dict]:
+    """Walk all files and parse them into chunks."""
+    all_chunks = []
+    files = find_code_files(source_path)
+
+    for file_path in files:
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            ext = Path(file_path).suffix
+            relative_path = os.path.relpath(file_path, source_path)
+
+            if ext in {".js", ".ts", ".jsx", ".tsx"}:
+                chunks = parse_javascript(content, relative_path)
+            elif ext == ".py":
+                chunks = parse_python(content, relative_path)
+            else:
+                chunks = parse_generic(content, relative_path, ext)
+
+            # Add unique IDs
+            for chunk in chunks:
+                chunk["id"] = f"{project_id}_{str(uuid.uuid4())[:8]}"
+                chunk["metadata"]["language"] = ext.lstrip(".")
+            all_chunks.extend(chunks)
+        except Exception as e:
+            print(f"Could not parse {file_path}: {e}")
+            continue
+
+    return all_chunks
+
+def find_code_files(source_path: str) -> list[str]:
+    files = []
+    for root, dirs, filenames in os.walk(source_path):
+        # Skip ignored directories
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+        for fname in filenames:
+            if Path(fname).suffix in CODE_EXTENSIONS:
+                files.append(os.path.join(root, fname))
+    return files
+
+def parse_javascript(content: str, file_path: str) -> list[dict]:
+    """Extract functions, classes, and imports from JS/TS using regex."""
+    chunks = []
+    lines = content.split("\n")
+
+    # Extract imports
+    imports = []
+    import_pattern = re.compile(r"^import\s+.+\s+from\s+['\"](.+)['\"]", re.MULTILINE)
+    require_pattern = re.compile(r"require\(['\"](.+)['\"]\)")
+    imports = import_pattern.findall(content) + require_pattern.findall(content)
+
+    # Extract named functions: function foo() { ... }
+    func_pattern = re.compile(r"(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(", re.MULTILINE)
+    # Extract arrow functions: const foo = () => { ... } or const foo = async () => ...
+    arrow_pattern = re.compile(r"(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(", re.MULTILINE)
+    # Extract classes: class Foo {
+    class_pattern = re.compile(r"(?:export\s+)?class\s+(\w+)", re.MULTILINE)
+
+    # Combine all named items — extract 30-line windows around each
+    for pattern, chunk_type in [(func_pattern, "function"), (arrow_pattern, "function"), (class_pattern, "class")]:
+        for match in pattern.finditer(content):
+            name = match.group(1)
+            start_line = content[:match.start()].count("\n")
+            end_line = min(start_line + 40, len(lines))
+            chunk_text = "\n".join(lines[start_line:end_line])
+            chunks.append({
+                "file_path": file_path,
+                "chunk_name": name,
+                "chunk_type": chunk_type,
+                "code_text": chunk_text,
+                "metadata": {
+                    "line_start": start_line,
+                    "line_end": end_line,
+                    "dependencies": imports
+                }
+            })
+
+    # Always add a file-level chunk with imports for graph building
+    chunks.append({
+        "file_path": file_path,
+        "chunk_name": file_path,
+        "chunk_type": "file",
+        "code_text": content[:500],   # First 500 chars as summary
+        "metadata": {"line_start": 0, "line_end": len(lines), "dependencies": imports}
+    })
+    return chunks
+
+def parse_python(content: str, file_path: str) -> list[dict]:
+    """Extract functions and classes from Python using regex."""
+    chunks = []
+    lines = content.split("\n")
+    imports = re.findall(r"^(?:import|from)\s+([\w.]+)", content, re.MULTILINE)
+
+    func_pattern = re.compile(r"^(?:async\s+)?def\s+(\w+)\s*\(", re.MULTILINE)
+    class_pattern = re.compile(r"^class\s+(\w+)", re.MULTILINE)
+
+    for pattern, chunk_type in [(func_pattern, "function"), (class_pattern, "class")]:
+        for match in pattern.finditer(content):
+            name = match.group(1)
+            start_line = content[:match.start()].count("\n")
+            end_line = min(start_line + 40, len(lines))
+            chunk_text = "\n".join(lines[start_line:end_line])
+            chunks.append({
+                "file_path": file_path,
+                "chunk_name": name,
+                "chunk_type": chunk_type,
+                "code_text": chunk_text,
+                "metadata": {"line_start": start_line, "line_end": end_line, "dependencies": imports}
+            })
+
+    chunks.append({
+        "file_path": file_path, "chunk_name": file_path, "chunk_type": "file",
+        "code_text": content[:500],
+        "metadata": {"line_start": 0, "line_end": len(lines), "dependencies": imports}
+    })
+    return chunks
+
+def parse_generic(content: str, file_path: str, ext: str) -> list[dict]:
+    """For unknown languages: chunk by 50-line sliding windows."""
+    chunks = []
+    lines = content.split("\n")
+    for i in range(0, len(lines), 40):
+        window = "\n".join(lines[i:i+50])
+        chunks.append({
+            "file_path": file_path,
+            "chunk_name": f"{file_path}:L{i}",
+            "chunk_type": "block",
+            "code_text": window,
+            "metadata": {"line_start": i, "line_end": i+50, "dependencies": []}
+        })
+    return chunks
+```
+
+---
+
+## MODULE 3: EMBEDDING PIPELINE (`backend/services/embedder.py`)
+
+```python
+"""
+Convert code chunks to OpenAI embeddings.
+Always batch — never call one-by-one.
+"""
+import openai, os, asyncio
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+async def generate_all_embeddings(chunks: list[dict]) -> list[list[float]]:
+    """
+    Takes all chunks, returns list of embedding vectors in same order.
+    Batches 100 at a time to stay within OpenAI limits.
+    """
+    texts = [c["code_text"][:8000] for c in chunks]   # Truncate to 8k chars max
+    all_embeddings = []
+    batch_size = 100
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        response = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=batch
+        )
+        batch_embeddings = [item.embedding for item in response.data]
+        all_embeddings.extend(batch_embeddings)
+
+        # Rate limit buffer between batches
+        if i + batch_size < len(texts):
+            await asyncio.sleep(0.3)
+
+    return all_embeddings
+
+async def embed_single(text: str) -> list[float]:
+    """Embed a single query (for error diagnosis and chat)."""
+    response = await client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text[:8000]
+    )
+    return response.data[0].embedding
+```
+
+---
+
+## MODULE 4: DEPENDENCY MAP (`backend/routes/map.py`)
+
+```python
+from fastapi import APIRouter
+from services.chroma_client import get_all_chunks
+from collections import defaultdict
+import ast, re
+
+router = APIRouter()
+
+@router.get("/map/{project_id}")
+async def get_dependency_map(project_id: str):
+    """
+    Returns nodes and edges for the React Flow graph.
+    Nodes = unique files
+    Edges = import relationships between files
+    """
+    result = get_all_chunks(project_id)
+    metadatas = result["metadatas"]
+    documents = result["documents"]
+
+    files = {}     # file_path → { functions, classes, imports }
+    edges = []
+    edge_set = set()
+
+    for meta in metadatas:
+        fp = meta["file_path"]
+        if fp not in files:
+            files[fp] = {"functions": [], "classes": [], "imports": [], "chunk_count": 0}
+        files[fp]["chunk_count"] += 1
+
+        if meta["chunk_type"] == "function":
+            files[fp]["functions"].append(meta["chunk_name"])
+        elif meta["chunk_type"] == "class":
+            files[fp]["classes"].append(meta["chunk_name"])
+        elif meta["chunk_type"] == "file":
+            # Parse dependency strings back into list
+            deps_str = meta.get("dependencies", "[]")
+            try:
+                deps = ast.literal_eval(deps_str)
+            except:
+                deps = []
+            files[fp]["imports"] = deps
+
+            # Create edges for each import
+            for dep in deps:
+                # Try to resolve relative imports to actual file paths
+                resolved = resolve_import(dep, fp, list(files.keys()))
+                if resolved and (fp, resolved) not in edge_set:
+                    edges.append({"source": fp, "target": resolved, "type": "imports"})
+                    edge_set.add((fp, resolved))
+
+    # Build nodes
+    nodes = []
+    for fp, data in files.items():
+        file_name = fp.split("/")[-1]
+        nodes.append({
+            "id": fp,
+            "data": {
+                "label": file_name,
+                "full_path": fp,
+                "functions": data["functions"],
+                "classes": data["classes"],
+                "imports": data["imports"],
+                "chunk_count": data["chunk_count"],
+                "is_entry": file_name in ["index.js", "main.py", "app.py", "index.ts", "main.ts"]
+            },
+            "type": "codeNode"   # Custom ReactFlow node type
+        })
+
+    stats = {
+        "total_files": len(files),
+        "total_functions": sum(len(f["functions"]) for f in files.values()),
+        "total_classes": sum(len(f["classes"]) for f in files.values()),
+        "total_edges": len(edges)
+    }
+    return {"nodes": nodes, "edges": edges, "stats": stats}
+
+def resolve_import(import_path: str, current_file: str, all_files: list[str]) -> str | None:
+    """Try to match an import string to an actual file in the project."""
+    if import_path.startswith("."):
+        current_dir = "/".join(current_file.split("/")[:-1])
+        candidates = [
+            f"{current_dir}/{import_path.lstrip('./')}",
+            f"{current_dir}/{import_path.lstrip('./')}.js",
+            f"{current_dir}/{import_path.lstrip('./')}.ts",
+            f"{current_dir}/{import_path.lstrip('./')}/index.js",
+        ]
+        for c in candidates:
+            if c in all_files:
+                return c
+    return None
+```
+
+---
+
+## MODULE 5: SEMANTIC ERROR DIAGNOSIS (`backend/routes/diagnose.py`)
+
+```python
+from fastapi import APIRouter
+from pydantic import BaseModel
+from services.embedder import embed_single
+from services.chroma_client import query_similar
+import re
+
+router = APIRouter()
+
+class DiagnoseRequest(BaseModel):
+    project_id: str
+    error_text: str
+
+@router.post("/diagnose")
+async def diagnose_error(req: DiagnoseRequest):
+    # 1. Embed the error text
+    error_embedding = await embed_single(req.error_text)
+
+    # 2. Semantic search in ChromaDB
+    results = query_similar(req.project_id, error_embedding, n_results=15)
+
+    # 3. Extract file paths from stack trace (for score boosting)
+    stack_files = re.findall(r"(?:at .+? \(|File \")(.+?)(?::\d+|\", line)", req.error_text)
+    stack_files = [f.split("/")[-1] for f in stack_files]   # Just filenames
+
+    # 4. Build ranked results with boosting
+    ranked = []
+    ids = results["ids"][0]
+    docs = results["documents"][0]
+    metas = results["metadatas"][0]
+    distances = results["distances"][0]
+
+    seen_files = set()
+    for i, (doc, meta, dist) in enumerate(zip(docs, metas, distances)):
+        similarity = round(1 - dist, 3)
+        file_name = meta["file_path"].split("/")[-1]
+
+        # Boost score if file appears in stack trace
+        if file_name in stack_files:
+            similarity = min(1.0, similarity + 0.25)
+
+        # Deduplicate by file — show best chunk per file
+        file_key = meta["file_path"]
+        if file_key in seen_files:
+            continue
+        seen_files.add(file_key)
+
+        ranked.append({
+            "file_path": meta["file_path"],
+            "chunk_name": meta["chunk_name"],
+            "chunk_type": meta["chunk_type"],
+            "code_snippet": doc[:400],
+            "similarity_score": similarity,
+            "line_start": meta.get("line_start", 0),
+            "in_stack_trace": file_name in stack_files,
+            "reason": "Found in stack trace + semantic match" if file_name in stack_files else "High semantic similarity to error"
+        })
+
+    # Sort by score
+    ranked.sort(key=lambda x: x["similarity_score"], reverse=True)
+    return {"results": ranked[:7], "stack_files_found": stack_files}
+```
+
+---
+
+## MODULE 6: CLOSED-LOOP SANDBOX (`backend/routes/sandbox.py`)
+
+```python
+from fastapi import APIRouter
+from pydantic import BaseModel
+import inngest
+from inngest_client import inngest_client
+
+router = APIRouter()
+
+class SandboxRequest(BaseModel):
+    project_id: str
+    repo_url: str
+    run_command: str          # e.g. "npm test" or "python -m pytest"
+    target_file: str          # file to fix, from error diagnosis
+    error_text: str           # the original error for context
+
+@router.post("/sandbox/run")
+async def run_sandbox(req: SandboxRequest):
+    """Fire the Inngest sandbox job and return immediately."""
+    await inngest_client.send(inngest.Event(
+        name="codelens/sandbox.run",
+        data={
+            "project_id": req.project_id,
+            "repo_url": req.repo_url,
+            "run_command": req.run_command,
+            "target_file": req.target_file,
+            "error_text": req.error_text
+        }
+    ))
+    return {"status": "started", "message": "Sandbox started. Watch progress in real-time."}
+```
+
+### Sandbox runner functions (`backend/services/sandbox_runner.py`):
+
+```python
+import subprocess, os, shutil
+from git import Repo
+from openai import OpenAI
+import diff_match_patch as dmp_module
+
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def clone_repo(repo_url: str, project_id: str) -> str:
+    sandbox_path = f"{os.getenv('SANDBOX_DIR', '/tmp/codelens_sandbox')}/{project_id}"
+    if os.path.exists(sandbox_path):
+        shutil.rmtree(sandbox_path)
+    Repo.clone_from(repo_url, sandbox_path, depth=1)
+    # Install dependencies
+    if os.path.exists(f"{sandbox_path}/package.json"):
+        subprocess.run(["npm", "install", "--legacy-peer-deps"], cwd=sandbox_path, timeout=60)
+    elif os.path.exists(f"{sandbox_path}/requirements.txt"):
+        subprocess.run(["pip", "install", "-r", "requirements.txt"], cwd=sandbox_path, timeout=60)
+    return sandbox_path
+
+def run_command_in_sandbox(sandbox_path: str, command: str) -> dict:
+    try:
+        result = subprocess.run(
+            command.split(),
+            cwd=sandbox_path,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            return {"success": True, "output": result.stdout}
+        else:
+            error = result.stderr or result.stdout
+            return {"success": False, "error": error[:3000]}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "Command timed out after 30 seconds"}
+
+def generate_fix_with_gpt(sandbox_path: str, target_file: str, error: str) -> dict:
+    file_full_path = os.path.join(sandbox_path, target_file)
+    with open(file_full_path, "r") as f:
+        original_code = f.read()
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert software debugger. "
+                    "You will be given a file and an error. "
+                    "Return ONLY the complete corrected file content with no explanation, "
+                    "no markdown fences, no backticks. Just the raw code."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"File: {target_file}\n\nCurrent code:\n{original_code}\n\nError:\n{error}\n\nFix the bug."
+            }
+        ],
+        temperature=0.1
+    )
+    fixed_code = response.choices[0].message.content.strip()
+
+    # Generate diff
+    dmp = dmp_module.diff_match_patch()
+    diffs = dmp.diff_main(original_code, fixed_code)
+    dmp.diff_cleanupSemantic(diffs)
+
+    # Simple summary prompt
+    summary_response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": f"In one sentence, what bug was fixed?\n\nDiff:\n{str(diffs[:5])}"}]
+    )
+    summary = summary_response.choices[0].message.content.strip()
+
+    return {"code": fixed_code, "diff": str(diffs), "summary": summary, "original": original_code}
+
+def apply_fix_to_file(sandbox_path: str, target_file: str, fixed_code: str):
+    file_full_path = os.path.join(sandbox_path, target_file)
+    with open(file_full_path, "w") as f:
+        f.write(fixed_code)
+```
+
+---
+
+## MODULE 7: CHAT WITH CODEBASE (`backend/routes/chat.py`)
+
+```python
+from fastapi import APIRouter
+from pydantic import BaseModel
+from services.embedder import embed_single
+from services.chroma_client import query_similar
+from openai import AsyncOpenAI
+import os
+
+router = APIRouter()
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+class ChatRequest(BaseModel):
+    project_id: str
+    message: str
+    history: list[dict] = []   # [{ role: "user"|"assistant", content: "..." }]
+
+@router.post("/chat")
+async def chat_with_codebase(req: ChatRequest):
+    # 1. Embed the user message
+    query_embedding = await embed_single(req.message)
+
+    # 2. Find relevant code chunks
+    results = query_similar(req.project_id, query_embedding, n_results=6)
+    chunks = results["documents"][0]
+    metas = results["metadatas"][0]
+
+    # 3. Build context string
+    context = "\n\n".join([
+        f"### File: {m['file_path']} | {m['chunk_type']}: {m['chunk_name']}\n{doc}"
+        for doc, m in zip(chunks, metas)
+    ])
+
+    # 4. Call GPT-4o with RAG
+    messages = [
+        {
+            "role": "system",
+            "content": f"""You are a codebase expert assistant. Answer the developer's question
+using ONLY the code context below. Be specific — mention exact file paths, function names,
+and line numbers when possible. Keep answers concise.
+
+CODEBASE CONTEXT:
+{context}"""
+        },
+        *req.history[-6:],   # Last 6 messages for context window efficiency
+        {"role": "user", "content": req.message}
+    ]
+
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        max_tokens=800,
+        temperature=0.2
+    )
+
+    sources = [{"file_path": m["file_path"], "chunk_name": m["chunk_name"]} for m in metas[:3]]
+    return {
+        "answer": response.choices[0].message.content,
+        "sources": sources
+    }
+```
+
+---
+
+## FRONTEND SETUP
+
+### Install dependencies:
+
+```bash
+cd frontend
+npm create vite@latest . -- --template react
+npm install
+npm install \
+  reactflow \
+  framer-motion \
+  zustand \
+  axios \
+  react-syntax-highlighter \
+  react-diff-viewer-continued \
+  dagre \
+  tailwindcss \
+  @tailwindcss/vite \
+  lucide-react \
+  clsx
+```
+
+### Configure Tailwind in `vite.config.js`:
+```js
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+})
+```
+
+### `frontend/.env`:
+```env
+VITE_API_URL=http://localhost:8000
+```
+
+---
+
+## FRONTEND UI — DESIGN SPECIFICATION (Critical — Read Every Word)
+
+### Overall Aesthetic: "Neural Terminal"
+- Think: a hacker's IDE meets a NASA mission control panel
+- Dark, dense, information-rich — but with moments of elegance and glow
+- Every interaction should feel like the machine is alive and thinking
+
+### Color System (use CSS variables in `index.css`):
+```css
+:root {
+  --bg-base:      #080c14;   /* Deep space black */
+  --bg-panel:     #0d1421;   /* Panel background */
+  --bg-elevated:  #111827;   /* Cards, modals */
+  --border:       #1e2d40;   /* Subtle borders */
+  --border-glow:  #1d4ed8;   /* Active borders */
+
+  --text-primary: #e2e8f0;   /* Main text */
+  --text-muted:   #64748b;   /* Secondary text */
+  --text-code:    #7dd3fc;   /* Code text */
+
+  --accent-blue:  #3b82f6;   /* Primary actions */
+  --accent-cyan:  #06b6d4;   /* Links, highlights */
+  --accent-green: #10b981;   /* Success, indexed */
+  --accent-red:   #ef4444;   /* Errors, warnings */
+  --accent-amber: #f59e0b;   /* In-progress */
+  --accent-purple:#8b5cf6;   /* AI/LLM actions */
+
+  --glow-blue: 0 0 20px rgba(59, 130, 246, 0.3);
+  --glow-green: 0 0 20px rgba(16, 185, 129, 0.3);
+  --glow-red: 0 0 20px rgba(239, 68, 68, 0.3);
+}
+```
+
+### Typography:
+```css
+/* Import in index.css */
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+body { font-family: 'Space Grotesk', sans-serif; }
+code, pre, .mono { font-family: 'JetBrains Mono', monospace; }
+```
+
+---
+
+## FRONTEND COMPONENT SPECIFICATIONS
+
+### `App.jsx` — Master Layout
+```
+Build a 3-column layout:
+  Left: Sidebar (240px, fixed) — navigation + project info
+  Center: Main content area (flex-grow)
+  Right: Context panel (320px, slides in when a node is selected)
+
+The sidebar has:
+  - CodeLens logo at top with a pulsing dot animation when processing
+  - Navigation items with animated left border indicator
+  - Project stats at bottom: "1,247 chunks • 63 files"
+
+Page transitions: Use framer-motion AnimatePresence with:
+  initial={{ opacity: 0, x: -10 }}
+  animate={{ opacity: 1, x: 0 }}
+  exit={{ opacity: 0, x: 10 }}
+  transition={{ duration: 0.2 }}
+```
+
+### `UploadPage.jsx` — Upload / Connect (Page 1)
+```
+Design a dramatic upload experience:
+
+1. Hero area: Large dashed border box with gradient background
+   - Icon: code brackets with a subtle float animation (CSS keyframes)
+   - Title: "Drop your codebase here"
+   - Two tabs: "Upload ZIP" | "GitHub URL"
+
+2. Upload ZIP mode:
+   - Drag-and-drop zone with framer-motion whileDrag scale animation
+   - On file drop: border turns cyan, icon morphs to checkmark with spring animation
+   - Show filename + file size
+
+3. GitHub URL mode:
+   - Input field with GitHub octocat icon prefix
+   - Branch input (default: main)
+   - Validate URL format in real-time (green/red border)
+
+4. On Submit — Animated processing sequence:
+   Show a vertical timeline of steps, each appearing with staggered animation:
+   [ ] Cloning repository...       → green checkmark with fade-in
+   [ ] Discovering files...        → "Found 63 files"
+   [ ] Parsing functions & classes → "Extracted 847 chunks"
+   [ ] Generating embeddings...    → animated progress bar
+   [ ] Building dependency graph   → checkmark
+   [ ] Ready!                      → CTA button: "Explore Map →"
+
+   Poll /api/status/{project_id} every 2 seconds to update this UI.
+   Animate each step completion with framer-motion scale + opacity.
+
+5. Recent projects list at bottom (from localStorage)
+```
+
+### `MapPage.jsx` — Dependency Map (Page 2)
+```
+This is the SHOWPIECE of the app. Make it extraordinary.
+
+Layout:
+  Full viewport ReactFlow canvas
+  Floating toolbar at top: zoom controls, layout button, search bar, filter dropdown
+  Right panel slides in on node click (framer-motion x animation)
+
+Custom ReactFlow node (codeNode):
+  - Rounded rectangle with gradient border (blue for JS, green for Python, amber for config)
+  - File name in bold
+  - Small badges: "12 fn" "3 cls" (function count, class count)
+  - Entry point files get a glowing cyan border + "ENTRY" badge
+  - Hover state: scale(1.05) with drop shadow glow matching file type color
+  - Selected state: bright border + background elevation
+
+ReactFlow edges:
+  - Animated dashed lines (strokeDasharray) flowing from source to target
+  - Color: muted blue, brightens on hover
+  - Edge label: "imports" (small, muted)
+
+Layout algorithm:
+  Use dagre for automatic top-down tree layout:
+  import dagre from 'dagre'
+  Calculate positions on component mount, animate nodes into position
+  with framer-motion (staggered entry, each node appears 50ms after previous)
+
+Search bar behavior:
+  - Type to highlight matching nodes (opacity 0.2 on non-matching)
+  - Matching nodes glow and scale up slightly
+  - Animate transitions with CSS transition
+
+Right panel on node click (slide in from right, 320px):
+  - File path (breadcrumb style)
+  - Functions list (clickable, each opens a code preview tooltip)
+  - Classes list
+  - "Imports:" section with links to other nodes
+  - "Imported by:" section
+  - Button: "Diagnose errors in this file →"
+
+Mini-map in bottom right corner (built into ReactFlow)
+Background: subtle dot grid pattern (ReactFlow Background component)
+
+Controls: ReactFlow Controls component + custom "Re-layout" button
+```
+
+### `DiagnosePage.jsx` — Error Diagnosis (Page 3)
+```
+Two-panel layout:
+  Left: Error input (40% width)
+  Right: Results (60% width)
+
+Left panel:
+  - Title: "Paste Production Error" with a red pulsing dot
+  - Large monospace textarea, dark background, red-tinted border
+  - Placeholder: real-looking error stack trace
+  - "Analyze Error" button — electric blue gradient, hover glow
+  - On submit: button shows spinning AI icon with "Analyzing..."
+
+Right panel — results appear with stagger animation:
+  Each result card animates in from the right with:
+    initial={{ opacity: 0, x: 30 }}
+    animate={{ opacity: 1, x: 0 }}
+    transition={{ delay: index * 0.1 }}
+
+  Result card design:
+    - Top bar: similarity score as a color-coded percentage (red 90%+, amber 70-90%, blue below)
+    - Similarity bar: animated fill from 0 to final value on mount
+    - File path in monospace cyan
+    - Function/class name in bold
+    - Code snippet with syntax highlighting (react-syntax-highlighter, "atomOneDark" theme)
+    - Tags: "In stack trace 🎯" badge if boosted
+    - CTA button: "Send to Sandbox" — appears on hover
+
+  Empty state: animated search icon with "Paste an error to begin"
+  
+  After results: "Found in 0.4s using semantic vector search" — muted caption
+```
+
+### `SandboxPage.jsx` — Auto-Fix Sandbox (Page 4)
+```
+This is the DRAMA of the app. Make it feel like a live mission.
+
+Top section — Configuration:
+  Three inline inputs: "Repo URL" | "Run Command" | "Target File"
+  (Pre-filled from error diagnosis if navigated from there)
+  "Launch Sandbox" button — RED with a rocket icon, pulse animation on hover
+
+Main section — Live Execution Console:
+  Dark terminal window (bg: #020408, green text #00ff41 Matrix style)
+  Monospace font throughout
+  Each log line appears with a typewriter animation (character by character)
+
+  Log format:
+    [12:34:01] 🔄 Cloning repository...
+    [12:34:05] ✅ Repository cloned — 847 files
+    [12:34:05] ▶️  Running: npm test
+    [12:34:08] ❌ Error detected in auth.js:47
+    [12:34:08] 🤖 GPT-4o analyzing error...
+    [12:34:11] 💡 Fix identified: null check missing on user object
+    [12:34:11] 📝 Applying fix to auth.js...
+    [12:34:11] 🔄 Retrying: npm test
+    [12:34:14] ✅ All tests passed!
+
+  Iteration tracker (top-right of terminal):
+    Circular progress: "Iteration 2/3" with animated ring
+
+Bottom section — Diff Viewer:
+  Appears after first fix attempt
+  Side-by-side diff (react-diff-viewer-continued)
+  Animated reveal: slides up from below
+  Header: "Changes applied to auth.js" with line count badge
+  "Download Fixed File" button
+  "Copy Fixed Code" button
+
+Success state:
+  Green particle burst animation (CSS only, no library)
+  "Fixed in 2 iterations" — large, bold, green
+  Summary: "Bug: Missing null check on user object in auth.js line 47"
+```
+
+### `ChatPage.jsx` — Chat with Codebase (Page 5)
+```
+Full-height chat interface:
+
+Top: "Chat with [ProjectName]" — subtitle: "1,247 chunks indexed • Powered by GPT-4o"
+
+Messages area:
+  User messages: right-aligned, blue bubble, Space Grotesk font
+  AI messages: left-aligned, dark panel background, animated typewriter reveal
+  
+  Below each AI message: "Sources" section expands with:
+    - File pills (clickable → opens in Map view)
+    - Function names in monospace
+
+Input area at bottom:
+  - Textarea (auto-resizing) with send button
+  - Keyboard shortcut: Enter to send, Shift+Enter for newline
+  - On send: message slides in from right with spring animation
+
+Suggested starter chips (shown when empty):
+  "🔍 Where is auth handled?"
+  "🗄️ What connects to the database?"
+  "🧩 Explain the main entry point"
+  "⚡ What are the most critical files?"
+  Each chip is a clickable pill that fills the input
+
+Empty state:
+  Animated brain/circuit icon
+  "Ask anything about your codebase"
+```
+
+---
+
+## ZUSTAND STATE STORE (`frontend/src/hooks/useProjectStore.js`)
+
+```javascript
+import { create } from 'zustand'
+import { persist } from 'zustand/middleware'
+
+const useProjectStore = create(persist(
+  (set, get) => ({
+    // Current project
+    projectId: null,
+    projectName: null,
+    projectStatus: null,   // "queued" | "parsing" | "embedding" | "complete"
+    projectProgress: 0,
+    stats: { files: 0, chunks: 0, functions: 0, classes: 0 },
+
+    // Graph data
+    graphNodes: [],
+    graphEdges: [],
+    selectedNode: null,
+
+    // Error diagnosis
+    lastError: null,
+    diagnosisResults: [],
+
+    // Sandbox
+    sandboxLog: [],
+    sandboxStatus: null,
+    sandboxIterations: [],
+
+    // Chat
+    chatHistory: [],
+
+    // Actions
+    setProject: (id, name) => set({ projectId: id, projectName: name }),
+    setStatus: (status, progress) => set({ projectStatus: status, projectProgress: progress }),
+    setGraph: (nodes, edges) => set({ graphNodes: nodes, graphEdges: edges }),
+    setSelectedNode: (node) => set({ selectedNode: node }),
+    setDiagnosisResults: (results) => set({ diagnosisResults: results }),
+    addSandboxLog: (line) => set(s => ({ sandboxLog: [...s.sandboxLog, line] })),
+    addChatMessage: (msg) => set(s => ({ chatHistory: [...s.chatHistory, msg] })),
+    clearChat: () => set({ chatHistory: [] }),
+  }),
+  { name: "codelens-store" }
+))
+
+export default useProjectStore
+```
+
+---
+
+## REACTFLOW DEPENDENCY MAP — Custom Node (`frontend/src/components/ui/CodeNode.jsx`)
+
+```jsx
+import { Handle, Position } from 'reactflow'
+import { motion } from 'framer-motion'
+
+const fileColors = {
+  js: { border: '#3b82f6', glow: 'rgba(59,130,246,0.3)', badge: 'bg-blue-500/20 text-blue-300' },
+  ts: { border: '#06b6d4', glow: 'rgba(6,182,212,0.3)', badge: 'bg-cyan-500/20 text-cyan-300' },
+  py: { border: '#f59e0b', glow: 'rgba(245,158,11,0.3)', badge: 'bg-amber-500/20 text-amber-300' },
+  default: { border: '#64748b', glow: 'rgba(100,116,139,0.2)', badge: 'bg-slate-500/20 text-slate-300' }
+}
+
+export default function CodeNode({ data, selected }) {
+  const ext = data.label.split('.').pop()
+  const colors = fileColors[ext] || fileColors.default
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, scale: 0.8 }}
+      animate={{ opacity: 1, scale: 1 }}
+      whileHover={{ scale: 1.05 }}
+      style={{
+        border: `1px solid ${selected ? '#fff' : colors.border}`,
+        boxShadow: selected ? `0 0 30px ${colors.glow}` : `0 0 10px ${colors.glow}`,
+        background: '#0d1421',
+        borderRadius: '8px',
+        padding: '10px 14px',
+        minWidth: '160px',
+        cursor: 'pointer',
+        transition: 'all 0.2s ease'
+      }}
+    >
+      <Handle type="target" position={Position.Top} style={{ background: colors.border }} />
+      
+      {data.is_entry && (
+        <span style={{ fontSize: '9px', background: '#06b6d4', color: '#000', padding: '1px 6px', borderRadius: '10px', fontWeight: 700 }}>
+          ENTRY
+        </span>
+      )}
+      
+      <div style={{ fontFamily: 'JetBrains Mono', fontSize: '12px', color: '#e2e8f0', fontWeight: 600, marginTop: '4px' }}>
+        {data.label}
+      </div>
+      
+      <div style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
+        {data.functions.length > 0 && (
+          <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '10px', background: 'rgba(59,130,246,0.15)', color: '#93c5fd' }}>
+            {data.functions.length} fn
+          </span>
+        )}
+        {data.classes.length > 0 && (
+          <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '10px', background: 'rgba(139,92,246,0.15)', color: '#c4b5fd' }}>
+            {data.classes.length} cls
+          </span>
+        )}
+      </div>
+      
+      <Handle type="source" position={Position.Bottom} style={{ background: colors.border }} />
+    </motion.div>
+  )
+}
+```
+
+---
+
+## DAGRE AUTO-LAYOUT UTILITY (`frontend/src/utils/layout.js`)
+
+```javascript
+import dagre from 'dagre'
+
+const NODE_WIDTH = 180
+const NODE_HEIGHT = 80
+
+export function applyDagreLayout(nodes, edges, direction = 'TB') {
+  const dagreGraph = new dagre.graphlib.Graph()
+  dagreGraph.setDefaultEdgeLabel(() => ({}))
+  dagreGraph.setGraph({ rankdir: direction, nodesep: 60, ranksep: 80 })
+
+  nodes.forEach(node => dagreGraph.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT }))
+  edges.forEach(edge => dagreGraph.setEdge(edge.source, edge.target))
+
+  dagre.layout(dagreGraph)
+
+  return nodes.map(node => {
+    const pos = dagreGraph.node(node.id)
+    return { ...node, position: { x: pos.x - NODE_WIDTH / 2, y: pos.y - NODE_HEIGHT / 2 } }
+  })
+}
+```
+
+---
+
+## API POLLING / SSE HOOK (`frontend/src/hooks/useSSE.js`)
+
+```javascript
+import { useEffect } from 'react'
+import useProjectStore from './useProjectStore'
+import axios from 'axios'
+
+const API = import.meta.env.VITE_API_URL
+
+/**
+ * Poll status endpoint every 2 seconds until project is complete.
+ * Updates Zustand store with progress.
+ */
+export function useStatusPolling(projectId) {
+  const { setStatus, setGraph } = useProjectStore()
+
+  useEffect(() => {
+    if (!projectId) return
+    let cancelled = false
+
+    const poll = async () => {
+      while (!cancelled) {
+        try {
+          const { data } = await axios.get(`${API}/api/status/${projectId}`)
+          setStatus(data.status, data.progress)
+
+          if (data.status === 'complete') {
+            // Load the dependency graph
+            const { data: graph } = await axios.get(`${API}/api/map/${projectId}`)
+            setGraph(graph.nodes, graph.edges)
+            break
+          }
+        } catch (e) {
+          console.error('Status poll failed:', e)
+        }
+        await new Promise(r => setTimeout(r, 2000))  // Wait 2s between polls
+      }
+    }
+
+    poll()
+    return () => { cancelled = true }
+  }, [projectId])
+}
+```
+
+---
+
+## API COST ESTIMATES (tell judges when asked)
+
+```
+text-embedding-3-small: $0.02 per 1M tokens
+  → 10k line repo ≈ 80k tokens ≈ $0.002 to index
+
+gpt-4o (fix generation): $2.50 per 1M input tokens
+  → Each fix ≈ 2k tokens ≈ $0.005
+
+gpt-4o-mini (chat): $0.15 per 1M tokens — nearly free
+
+Total demo cost per full repo: under $0.05
+```
+
+---
+
+## BUILD ORDER — Follow This Exactly
+
+```
+HOUR 1-2:   Backend scaffold + .env + ChromaDB client working
+            Test: python main.py → Swagger UI at localhost:8000/docs
+
+HOUR 3-4:   Ingest route + Parser + Embedder working end-to-end
+            Test: POST /api/ingest with a small ZIP → see ChromaDB data saved
+
+HOUR 5-6:   Inngest integration — fire background job on ingest
+            Test: Upload → watch Inngest dashboard at localhost:8288
+
+HOUR 7-8:   Map route → ReactFlow frontend → see nodes and edges
+
+HOUR 9-10:  Error Diagnosis route + frontend card UI
+
+HOUR 11-12: Sandbox runner (basic — just run + GPT fix, 1 iteration first)
+
+HOUR 13:    Chat route + chat UI
+
+HOUR 14:    Sandbox iterations + diff viewer
+
+HOUR 15:    UI polish — animations, colors, loading states
+
+HOUR 16:    Deploy + demo rehearsal
+```
+
+---
+
+## DEPLOYMENT
+
+```bash
+# Backend → Railway (recommended, handles Python + long-running processes)
+# 1. Install Railway CLI: npm install -g @railway/cli
+# 2. railway login
+# 3. cd backend && railway up
+# 4. Add all .env vars in Railway dashboard
+
+# Frontend → Vercel
+# 1. cd frontend && vercel --prod
+# 2. Set VITE_API_URL to your Railway backend URL in Vercel dashboard
+
+# Inngest in production:
+# Change is_production=True in inngest_client.py
+# Add your Railway backend URL in Inngest dashboard → Apps → Sync URL
+```
+
+---
+
+## DEMO SCRIPT FOR JUDGES (90 seconds)
+
+```
+0:00 — Open app. Show the clean dark UI.
+      "CodeLens gives any developer an X-ray of any codebase."
+
+0:10 — Paste GitHub URL: https://github.com/pallets/flask
+       Hit ingest. Watch the live progress timeline animate.
+
+0:30 — Map appears. Zoom around. Click a node.
+       "Every file, every function, every dependency — instantly visible."
+       Show the right panel with function list.
+
+0:50 — Switch to Error Diagnosis. Paste a real Flask error.
+       Results appear in 1 second. Point to the similarity scores.
+       "The system found the exact file causing this — without searching manually."
+
+1:05 — Switch to Chat. Ask: "What calls the request context?"
+       Show AI answer with source files.
+       "The same embeddings power natural language Q&A."
+
+1:20 — Flash the Sandbox page.
+       "And it can autonomously clone, run, fix, and retry — in a closed loop."
+
+1:30 — Done.
+```
+
+---
+
+## ONE-LINE PITCH
+
+> "CodeLens AI maps any codebase in 60 seconds, traces any production error to
+>  its source file using semantic search, and autonomously patches bugs in a
+>  sandboxed loop — powered by ChromaDB, Inngest, and GPT-4o."
+```
