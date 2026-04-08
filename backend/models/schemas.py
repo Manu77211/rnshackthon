@@ -56,6 +56,7 @@ class AnalyzeNode(BaseModel):
     file_path: str
     line_start: int | None = None
     line_end: int | None = None
+    embedding: list[float] | None = None
 
 
 class AnalyzeEdge(BaseModel):
@@ -193,3 +194,60 @@ class InsightResponse(BaseModel):
     action_items: list[str]
     references: list[InsightReference]
     provider: str
+
+
+class PRReviewRequest(BaseModel):
+    project_id: str = Field(min_length=3)
+    pr_url: str = Field(min_length=18)
+    include_ai: bool = True
+    max_findings: int = Field(default=20, ge=1, le=60)
+
+
+class PRReviewReference(BaseModel):
+    file_path: str
+    chunk_name: str
+    similarity_score: float
+
+
+class PRReviewFinding(BaseModel):
+    finding_id: str
+    risk_type: str
+    severity: str
+    risk_score: float
+    file_path: str
+    line_number: int
+    code_snippet: str
+    reason: str
+    ai_explanation: str
+    suggested_fix: str
+    references: list[PRReviewReference]
+
+
+class PRReviewImpactNode(BaseModel):
+    id: str
+    type: str
+    name: str
+    file_path: str
+
+
+class PRReviewImpactEdge(BaseModel):
+    source: str
+    target: str
+    type: str
+
+
+class PRReviewImpactGraph(BaseModel):
+    nodes: list[PRReviewImpactNode]
+    edges: list[PRReviewImpactEdge]
+
+
+class PRReviewResponse(BaseModel):
+    provider: str
+    embedding_backend: str
+    pr_number: int
+    repository: str
+    title: str
+    changed_files: list[str]
+    findings: list[PRReviewFinding]
+    summary: dict[str, int]
+    impact_graph: PRReviewImpactGraph

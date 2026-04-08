@@ -85,15 +85,20 @@ def _collect_nodes(chunks: list[Chunk]) -> tuple[list[Node], dict[tuple[str, str
         if not file_path or not chunk_name:
             continue
         node_id = _symbol_id(file_path, chunk_type, chunk_name)
+        metadata = chunk.get("metadata", {})
+        embedding = metadata.get("embedding") if isinstance(metadata, dict) else None
+        node_payload: Node = {
+            "id": node_id,
+            "type": chunk_type,
+            "name": chunk_name,
+            "file_path": file_path,
+            "line_start": int(chunk.get("metadata", {}).get("line_start", 0)),
+            "line_end": int(chunk.get("metadata", {}).get("line_end", 0)),
+        }
+        if isinstance(embedding, list) and embedding:
+            node_payload["embedding"] = embedding
         nodes.append(
-            {
-                "id": node_id,
-                "type": chunk_type,
-                "name": chunk_name,
-                "file_path": file_path,
-                "line_start": int(chunk.get("metadata", {}).get("line_start", 0)),
-                "line_end": int(chunk.get("metadata", {}).get("line_end", 0)),
-            }
+            node_payload
         )
         symbol_index[(file_path, chunk_name)] = node_id
         symbols_by_name.setdefault(chunk_name.split(".")[-1], []).append(node_id)

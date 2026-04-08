@@ -6,6 +6,7 @@ import zipfile
 from pathlib import Path
 from uuid import uuid4
 from models.schemas import StatusResponse
+from services.embedding_service import attach_embeddings_to_chunks
 from services.graph_builder import build_graph_from_chunks
 from services.parser import discover_files, parse_file
 from services.project_store import chunks_file, project_file, source_dir, write_json
@@ -70,12 +71,14 @@ async def run_ingestion_pipeline(
         StatusResponse(project_id=project_id, status="embedding", progress=55),
     )
     file_count, chunks = await asyncio.to_thread(_parse_chunks, source)
+    embedding_backend = await attach_embeddings_to_chunks(chunks)
 
     await write_status(
         org_id,
-        StatusResponse(project_id=project_id, status="storing", progress=80),
+        StatusResponse(project_id=project_id, status="storing", progress=82),
     )
     graph = build_graph_from_chunks(project_id, chunks)
+    graph["embedding_backend"] = embedding_backend
     await write_json(chunks_file(org_id, project_id), chunks)
     await write_json(project_file(org_id, project_id), graph)
     await write_json(
@@ -86,6 +89,7 @@ async def run_ingestion_pipeline(
             "chunk_count": len(chunks),
             "graph_nodes": len(graph.get("nodes", [])),
             "graph_edges": len(graph.get("edges", [])),
+            "embedding_backend": embedding_backend,
         },
     )
 

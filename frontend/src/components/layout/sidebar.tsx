@@ -1,5 +1,8 @@
+"use client";
+
+import { useState } from "react";
 import { modules, type ModuleKey } from "@/components/modules/module-data";
-import { Bot, Bug, GitGraph, GitPullRequest, ScanSearch, UploadCloud, Wrench } from "lucide-react";
+import { Bot, Bug, GitGraph, GitPullRequest, ScanSearch, UploadCloud, Wrench, ChevronRight, ChevronLeft } from "lucide-react";
 
 type SidebarProps = {
   active: ModuleKey;
@@ -18,40 +21,64 @@ const iconMap = {
 } as const;
 
 export function Sidebar({ active, onSelect, hasProject }: SidebarProps) {
+  const [expanded, setExpanded] = useState(false);
+
   return (
-    <aside className="w-full border-r border-slate-200 bg-white/80 p-4 md:w-72 md:min-h-[calc(100vh-81px)]">
-      <p className="mb-1 text-xs uppercase tracking-[0.2em] text-slate-500">Workflow</p>
-      <p className="mb-4 text-xs text-slate-600">GitVizz-style module navigation</p>
-      <nav className="grid gap-2">
-        {modules.map((module) => {
-          const Icon = iconMap[module.key];
-          const selected = module.key === active;
-          return (
-            <button
-              key={module.key}
-              onClick={() => onSelect(module.key)}
-              className={[
-                "rounded-xl border px-4 py-3 text-left transition",
-                selected
-                  ? "border-sky-300 bg-sky-50 text-sky-900"
-                  : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50",
-              ].join(" ")}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <p className="flex items-center gap-2 text-sm font-medium">
-                  <Icon className="h-4 w-4" />
-                  {module.title}
-                </p>
-                <span className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{module.phase}</span>
-              </div>
-            </button>
-          );
-        })}
-      </nav>
-      <div className="mt-6 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-        <p className="uppercase tracking-[0.2em] text-slate-500">Session</p>
-        <p className="mt-2 font-medium text-slate-700">{hasProject ? "Repository indexed" : "Waiting for ingestion"}</p>
+    <aside
+      className={`min-h-[calc(100vh-81px)] border-r border-slate-200 bg-white/90 transition-all duration-300 overflow-hidden flex flex-col ${
+        expanded ? "w-64" : "w-16"
+      }`}
+    >
+      {/* Toggle Button */}
+      <div className="flex items-center justify-center p-2 border-b border-slate-200">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="rounded-lg p-1.5 hover:bg-slate-100 transition text-slate-600"
+          title={expanded ? "Collapse" : "Expand"}
+        >
+          {expanded ? <ChevronLeft className="h-5 w-5" /> : <ChevronRight className="h-5 w-5" />}
+        </button>
       </div>
+
+      {/* Navigation */}
+      <nav className="flex-1 overflow-y-auto px-1 py-2">
+        <div className="grid gap-1">
+          {modules.map((module) => {
+            const Icon = iconMap[module.key];
+            const selected = module.key === active;
+            return (
+              <button
+                key={module.key}
+                onClick={() => onSelect(module.key)}
+                className={`rounded-lg p-2 transition flex items-center justify-center ${
+                  expanded ? "justify-start px-3" : "justify-center"
+                } ${
+                  selected
+                    ? "bg-sky-100 text-sky-900"
+                    : "text-slate-600 hover:bg-slate-100"
+                }`}
+                title={!expanded ? module.title : ""}
+              >
+                <Icon className="h-5 w-5 flex-shrink-0" />
+                {expanded && (
+                  <div className="ml-3 text-left min-w-0">
+                    <p className="text-sm font-medium truncate">{module.title}</p>
+                    <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{module.phase}</p>
+                  </div>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </nav>
+
+      {/* Session Info */}
+      {expanded && (
+        <div className="border-t border-slate-200 p-2 m-2 rounded-lg bg-slate-50">
+          <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-semibold px-1">Session</p>
+          <p className="text-xs font-medium text-slate-700 mt-2 px-1">{hasProject ? "Repository indexed" : "Waiting..."}</p>
+        </div>
+      )}
     </aside>
   );
 }

@@ -31,6 +31,7 @@ export function DependencyGraph({ data, onSelectNode }: DependencyGraphProps) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const cyContainerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
+  const onSelectNodeRef = useRef(onSelectNode);
   const [size, setSize] = useState({ width: 980, height: 560 });
   const [search, setSearch] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState<string>("");
@@ -40,6 +41,10 @@ export function DependencyGraph({ data, onSelectNode }: DependencyGraphProps) {
     function: true,
     issue: true,
   });
+
+  useEffect(() => {
+    onSelectNodeRef.current = onSelectNode;
+  }, [onSelectNode]);
 
   useEffect(() => {
     if (!wrapperRef.current) {
@@ -173,13 +178,13 @@ export function DependencyGraph({ data, onSelectNode }: DependencyGraphProps) {
   }
 
   useEffect(() => {
-    if (!cyContainerRef.current) {
+    if (!cyContainerRef.current || cyRef.current) {
       return;
     }
 
     const cy = cytoscape({
       container: cyContainerRef.current,
-      elements,
+      elements: [],
       style: [
         {
           selector: "node",
@@ -249,11 +254,10 @@ export function DependencyGraph({ data, onSelectNode }: DependencyGraphProps) {
       ],
       layout: {
         name: layout,
-        animate: true,
+        animate: false,
         fit: true,
         padding: 20,
       },
-      wheelSensitivity: 0.25,
       minZoom: 0.2,
       maxZoom: 3,
     });
@@ -264,7 +268,7 @@ export function DependencyGraph({ data, onSelectNode }: DependencyGraphProps) {
       const nodeId = String(node.id());
       setSelectedNodeId(nodeId);
       if (typeof filePath === "string" && filePath) {
-        onSelectNode(filePath);
+        onSelectNodeRef.current(filePath);
       }
     });
 
@@ -281,10 +285,48 @@ export function DependencyGraph({ data, onSelectNode }: DependencyGraphProps) {
 
     cyRef.current = cy;
     return () => {
+      cy.removeAllListeners();
+      cy.stop();
       cy.destroy();
-      cyRef.current = null;
+      if (cyRef.current === cy) {
+        cyRef.current = null;
+      }
     };
-  }, [elements, layout, onSelectNode]);
+  }, []);
+
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy) {
+      return;
+    }
+
+    cy.batch(() => {
+      cy.elements().remove();
+      if (elements.length > 0) {
+        cy.add(elements);
+      }
+    });
+
+    const layoutRunner = cy.layout({
+      name: layout,
+      animate: false,
+      fit: true,
+      padding: 20,
+    });
+    layoutRunner.run();
+
+    return () => {
+      layoutRunner.stop();
+    };
+  }, [elements, layout]);
+
+  useEffect(() => {
+    const cy = cyRef.current;
+    if (!cy) {
+      return;
+    }
+    cy.resize();
+  }, [size.height, size.width]);
 
   useEffect(() => {
     const cy = cyRef.current;

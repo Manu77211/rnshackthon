@@ -168,6 +168,60 @@ export type GitSummaryResponse = {
   clusters: GitClusterSummary[];
 };
 
+export type PRReviewReference = {
+  file_path: string;
+  chunk_name: string;
+  similarity_score: number;
+};
+
+export type PRReviewFinding = {
+  finding_id: string;
+  risk_type: string;
+  severity: string;
+  risk_score: number;
+  file_path: string;
+  line_number: number;
+  code_snippet: string;
+  reason: string;
+  ai_explanation: string;
+  suggested_fix: string;
+  references: PRReviewReference[];
+};
+
+export type PRReviewImpactNode = {
+  id: string;
+  type: string;
+  name: string;
+  file_path: string;
+};
+
+export type PRReviewImpactEdge = {
+  source: string;
+  target: string;
+  type: string;
+};
+
+export type PRReviewResponse = {
+  provider: string;
+  embedding_backend: string;
+  pr_number: number;
+  repository: string;
+  title: string;
+  changed_files: string[];
+  findings: PRReviewFinding[];
+  summary: {
+    total: number;
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+  };
+  impact_graph: {
+    nodes: PRReviewImpactNode[];
+    edges: PRReviewImpactEdge[];
+  };
+};
+
 type GithubIngestPayload = {
   repoUrl: string;
   branch: string;
@@ -464,6 +518,35 @@ export async function fetchGitSummary(projectId: string): Promise<GitSummaryResp
       throw new Error(response.statusText || "Failed to load Git summary.");
     }
     return (await response.json()) as GitSummaryResponse;
+  } catch (error) {
+    throw new Error(normalizeError(error));
+  }
+}
+
+export async function analyzePullRequest(payload: {
+  projectId: string;
+  prUrl: string;
+  includeAI?: boolean;
+  maxFindings?: number;
+}): Promise<PRReviewResponse> {
+  try {
+    const response = await fetch(`${API_BASE_URL}/pr-review`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${DEV_JWT}`,
+      },
+      body: JSON.stringify({
+        project_id: payload.projectId,
+        pr_url: payload.prUrl,
+        include_ai: payload.includeAI ?? true,
+        max_findings: payload.maxFindings ?? 20,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(response.statusText || "Failed to analyze PR.");
+    }
+    return (await response.json()) as PRReviewResponse;
   } catch (error) {
     throw new Error(normalizeError(error));
   }

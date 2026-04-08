@@ -14,6 +14,7 @@ from routes.git_summary import router as git_summary_router
 from routes.ingest import router as ingest_router
 from routes.insights import router as insights_router
 from routes.map import router as map_router
+from routes.pr_review import router as pr_review_router
 from routes.sandbox import router as sandbox_router
 from routes.similarity import router as similarity_router
 from routes.status import router as status_router
@@ -46,6 +47,7 @@ app.include_router(explorer_router, prefix="/api")
 app.include_router(sandbox_router, prefix="/api")
 app.include_router(similarity_router, prefix="/api")
 app.include_router(insights_router, prefix="/api")
+app.include_router(pr_review_router, prefix="/api")
 
 
 @app.get("/api/health")
