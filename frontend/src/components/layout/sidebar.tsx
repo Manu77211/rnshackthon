@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { modules, type ModuleKey } from "@/components/modules/module-data";
-import { Bot, Bug, GitGraph, GitPullRequest, ScanSearch, UploadCloud, Wrench, ChevronRight, ChevronLeft } from "lucide-react";
+import { Bot, GitGraph, GitPullRequest, UploadCloud, Wrench, ChevronRight, ChevronLeft } from "lucide-react";
 
 type SidebarProps = {
   active: ModuleKey;
@@ -11,10 +11,8 @@ type SidebarProps = {
 };
 
 const iconMap = {
-  environment: ScanSearch,
   ingest: UploadCloud,
   map: GitGraph,
-  diagnose: Bug,
   git: GitPullRequest,
   sandbox: Wrench,
   chat: Bot,
@@ -25,15 +23,15 @@ export function Sidebar({ active, onSelect, hasProject }: SidebarProps) {
 
   return (
     <aside
-      className={`min-h-[calc(100vh-81px)] border-r border-slate-200 bg-white/90 transition-all duration-300 overflow-hidden flex flex-col ${
+      className={`min-h-[calc(100vh-81px)] border-r border-black bg-black text-white transition-all duration-300 overflow-hidden flex flex-col ${
         expanded ? "w-64" : "w-16"
       }`}
     >
       {/* Toggle Button */}
-      <div className="flex items-center justify-center p-2 border-b border-slate-200">
+      <div className="flex items-center justify-center border-b border-white/20 p-2">
         <button
           onClick={() => setExpanded(!expanded)}
-          className="rounded-lg p-1.5 hover:bg-slate-100 transition text-slate-600"
+          className="rounded-lg p-1.5 text-white/80 transition hover:bg-white/10 hover:text-white"
           title={expanded ? "Collapse" : "Expand"}
         >
           {expanded ? <ChevronLeft className="h-5 w-5" /> : <ChevronRight className="h-5 w-5" />}
@@ -54,16 +52,15 @@ export function Sidebar({ active, onSelect, hasProject }: SidebarProps) {
                   expanded ? "justify-start px-3" : "justify-center"
                 } ${
                   selected
-                    ? "bg-sky-100 text-sky-900"
-                    : "text-slate-600 hover:bg-slate-100"
+                    ? "bg-white text-black"
+                    : "text-white/70 hover:bg-white/10 hover:text-white"
                 }`}
                 title={!expanded ? module.title : ""}
               >
-                <Icon className="h-5 w-5 flex-shrink-0" />
+                <Icon className="h-5 w-5 shrink-0" />
                 {expanded && (
                   <div className="ml-3 text-left min-w-0">
                     <p className="text-sm font-medium truncate">{module.title}</p>
-                    <p className="text-[10px] uppercase tracking-[0.18em] text-slate-400">{module.phase}</p>
                   </div>
                 )}
               </button>
@@ -74,9 +71,9 @@ export function Sidebar({ active, onSelect, hasProject }: SidebarProps) {
 
       {/* Session Info */}
       {expanded && (
-        <div className="border-t border-slate-200 p-2 m-2 rounded-lg bg-slate-50">
-          <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 font-semibold px-1">Session</p>
-          <p className="text-xs font-medium text-slate-700 mt-2 px-1">{hasProject ? "Repository indexed" : "Waiting..."}</p>
+        <div className="m-2 rounded-lg border border-white/20 bg-white/5 p-2">
+          <p className="px-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/60">Session</p>
+          <p className="mt-2 px-1 text-xs font-medium text-white/80">{hasProject ? "Repository indexed" : "Waiting for repository"}</p>
         </div>
       )}
     </aside>

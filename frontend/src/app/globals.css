@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f7f8fc;
-  --foreground: #0f172a;
+  --background: #ffffff;
+  --foreground: #0a0a0a;
 }
 
 @theme inline {
@@ -21,10 +21,10 @@ body {
 
 .bg-grid {
   background-image:
-    radial-gradient(circle at 8% 0%, rgba(14, 165, 233, 0.14), transparent 40%),
-    radial-gradient(circle at 95% 6%, rgba(99, 102, 241, 0.1), transparent 32%),
-    linear-gradient(to bottom right, #ffffff, #f8fafc 52%, #eef2ff),
-    linear-gradient(rgba(148, 163, 184, 0.16) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(148, 163, 184, 0.16) 1px, transparent 1px);
-  background-size: auto, auto, auto, 24px 24px, 24px 24px;
+    radial-gradient(circle at 6% 0%, rgba(0, 0, 0, 0.08), transparent 36%),
+    radial-gradient(circle at 100% 0%, rgba(0, 0, 0, 0.08), transparent 28%),
+    linear-gradient(#fafafa, #ffffff 52%, #f5f5f5),
+    linear-gradient(rgba(0, 0, 0, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.06) 1px, transparent 1px);
+  background-size: auto, auto, auto, 26px 26px, 26px 26px;
 }
