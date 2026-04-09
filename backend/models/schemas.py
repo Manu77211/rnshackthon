@@ -157,6 +157,48 @@ class SandboxFixDetailResponse(BaseModel):
     diff_preview: str
 
 
+class SandboxRunRequest(BaseModel):
+    project_id: str = Field(min_length=3)
+    command: str | None = Field(default=None, min_length=1, max_length=220)
+    timeout_sec: int = Field(default=120, ge=15, le=900)
+    include_ai_insights: bool = True
+
+
+class SandboxRunInsight(BaseModel):
+    summary: str
+    probable_root_cause: str
+    action_items: list[str]
+    provider: str
+
+
+class SandboxRunResponse(BaseModel):
+    project_id: str
+    profile: str
+    command: str
+    exit_code: int
+    timed_out: bool
+    duration_ms: int
+    stdout: str
+    stderr: str
+    diagnosis: list[DiagnoseResult]
+    insights: SandboxRunInsight | None = None
+
+
+class SandboxSuggestRequest(BaseModel):
+    project_id: str = Field(min_length=3)
+    file_path: str = Field(min_length=1)
+    instruction: str = Field(default="Fix errors and improve safety", min_length=3, max_length=300)
+    error_text: str | None = Field(default=None, min_length=8)
+
+
+class SandboxSuggestResponse(BaseModel):
+    file_path: str
+    language: str
+    updated_content: str
+    summary: str
+    provider: str
+
+
 class SimilarityRequest(BaseModel):
     project_id: str = Field(min_length=3)
     code_text: str = Field(min_length=8)

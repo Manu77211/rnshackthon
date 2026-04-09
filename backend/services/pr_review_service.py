@@ -4,6 +4,7 @@ import re
 from typing import Any
 from urllib import error, request
 
+from services.aws_deepseek_service import deepseek_json
 from services.embedding_service import rank_chunks
 from services.project_store import chunks_file, project_file, read_json
 
@@ -48,27 +49,40 @@ PATTERNS: list[dict[str, Any]] = [
 ]
 
 
-def _github_headers() -> dict[str, str]:
+def _github_headers(include_auth: bool = True) -> dict[str, str]:
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "CodeLens-AI-PR-Review",
     }
     token = os.getenv("GITHUB_TOKEN", "").strip()
-    if token:
+    if include_auth and token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
 
-def _http_get_json(url: str) -> Any:
-    req = request.Request(url, headers=_github_headers(), method="GET")
+def _http_get_json(url: str, include_auth: bool = True) -> Any:
+    req = request.Request(url, headers=_github_headers(include_auth=include_auth), method="GET")
     try:
         with request.urlopen(req, timeout=20) as response:
             payload = response.read().decode("utf-8")
     except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
         if exc.code == 404:
             raise ValueError("PR not found or not accessible") from exc
         if exc.code in {401, 403}:
-            raise ValueError("GitHub API denied access. Check GITHUB_TOKEN permissions.") from exc
+            token = os.getenv("GITHUB_TOKEN", "").strip()
+            # Public repositories can still be read without a token. If token is rate-limited,
+            # retry once without Authorization to keep the PR flow usable.
+            if include_auth and token:
+                return _http_get_json(url, include_auth=False)
+            message = "GitHub API denied access."
+            if "rate limit" in detail.lower():
+                message = "GitHub API rate limit reached. Provide GITHUB_TOKEN or retry later."
+            elif "resource not accessible" in detail.lower():
+                message = "GitHub API denied access for this PR. Check token scopes/repo visibility."
+            else:
+                message = "GitHub API denied access. Check GITHUB_TOKEN permissions."
+            raise ValueError(message) from exc
         raise ValueError("Failed to call GitHub API") from exc
     except error.URLError as exc:
         raise ValueError("Unable to reach GitHub API") from exc
@@ -79,13 +93,23 @@ def _http_get_json(url: str) -> Any:
 
 
 def _parse_pr_url(pr_url: str) -> tuple[str, str, int]:
-    match = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", pr_url.strip())
-    if not match:
-        raise ValueError("Invalid PR URL. Expected format: https://github.com/<owner>/<repo>/pull/<number>")
-    owner = match.group(1)
-    repo = match.group(2).replace(".git", "")
-    number = int(match.group(3))
-    return owner, repo, number
+    raw = pr_url.strip()
+
+    web = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", raw)
+    if web:
+        return web.group(1), web.group(2).replace(".git", ""), int(web.group(3))
+
+    api = re.search(r"api\.github\.com/repos/([^/]+)/([^/]+)/pulls/(\d+)", raw)
+    if api:
+        return api.group(1), api.group(2).replace(".git", ""), int(api.group(3))
+
+    short = re.search(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#(\d+)$", raw)
+    if short:
+        return short.group(1), short.group(2).replace(".git", ""), int(short.group(3))
+
+    raise ValueError(
+        "Invalid PR reference. Use https://github.com/<owner>/<repo>/pull/<number> or owner/repo#<number>."
+    )
 
 
 def _fetch_pr_meta(owner: str, repo: str, pr_number: int) -> dict[str, Any]:
@@ -226,6 +250,18 @@ def _openai_review(prompt: str) -> dict[str, Any] | None:
         return None
 
 
+def _ai_review(prompt: str) -> tuple[dict[str, Any] | None, str]:
+    deepseek_payload, deepseek_error, deepseek_provider = deepseek_json(prompt)
+    if deepseek_payload:
+        return deepseek_payload, deepseek_provider or "aws-deepseek"
+    openai_payload = _openai_review(prompt)
+    if openai_payload:
+        return openai_payload, "openai"
+    if deepseek_error and deepseek_error != "missing-gateway-config":
+        return None, f"unavailable:{deepseek_error}"
+    return None, "unavailable"
+
+
 def _ai_prompt(finding: dict[str, Any], refs: list[dict[str, Any]]) -> str:
     ref_text = "\n".join(
         f"- {item['file_path']}::{item['chunk_name']} ({item['similarity_score']})"
@@ -323,6 +359,8 @@ async def analyze_pull_request(
     findings: list[dict[str, Any]] = []
     changed_files: list[str] = []
     embedding_backend = "none"
+    ai_used = False
+    ai_provider = "rules+embeddings"
 
     for file_item in pr_files:
         file_path = str(file_item.get("filename", ""))
@@ -371,10 +409,12 @@ async def analyze_pull_request(
         suggested_fix = fallback_fix
 
         if include_ai:
-            ai_data = _openai_review(_ai_prompt(finding, refs))
+            ai_data, provider_used = _ai_review(_ai_prompt(finding, refs))
             if ai_data:
                 explanation = str(ai_data.get("explanation", fallback_explanation))
                 suggested_fix = str(ai_data.get("fix", fallback_fix))
+                ai_used = True
+                ai_provider = f"{provider_used}+rules+embeddings"
 
         enriched.append(
             {
@@ -403,7 +443,7 @@ async def analyze_pull_request(
     impact_graph = _impact_graph(graph_payload, set(changed_files))
 
     return {
-        "provider": "openai+rules+embeddings" if include_ai else "rules+embeddings",
+        "provider": ai_provider if ai_used else "rules+embeddings",
         "embedding_backend": embedding_backend,
         "pr_number": pr_number,
         "repository": f"{owner}/{repo}",

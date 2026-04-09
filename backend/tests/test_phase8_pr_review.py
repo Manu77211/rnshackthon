@@ -1,4 +1,8 @@
-from services.pr_review_service import _scan_patch, analyze_pull_request
+import io
+
+from urllib.error import HTTPError
+
+from services.pr_review_service import _http_get_json, _parse_pr_url, _scan_patch, analyze_pull_request
 
 
 def test_scan_patch_detects_security_findings() -> None:
@@ -16,6 +20,50 @@ def test_scan_patch_detects_security_findings() -> None:
     risk_types = {item["risk_type"] for item in findings}
     assert "sql_injection" in risk_types
     assert "xss" in risk_types
+
+
+def test_parse_pr_url_supports_multiple_formats() -> None:
+    owner, repo, number = _parse_pr_url("https://github.com/example/repo/pull/12?tab=files")
+    assert owner == "example"
+    assert repo == "repo"
+    assert number == 12
+
+    owner2, repo2, number2 = _parse_pr_url("example/repo#15")
+    assert owner2 == "example"
+    assert repo2 == "repo"
+    assert number2 == 15
+
+
+def test_http_get_json_retries_without_auth_for_public_repo(monkeypatch) -> None:
+    class _Response:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def read(self) -> bytes:
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def _fake_urlopen(req, timeout=20):  # noqa: ARG001
+        if req.headers.get("Authorization"):
+            raise HTTPError(
+                req.full_url,
+                403,
+                "Forbidden",
+                hdrs=None,
+                fp=io.BytesIO(b'{"message": "API rate limit exceeded"}'),
+            )
+        return _Response(b'{"ok": true}')
+
+    monkeypatch.setenv("GITHUB_TOKEN", "limited-token")
+    monkeypatch.setattr("services.pr_review_service.request.urlopen", _fake_urlopen)
+
+    payload = _http_get_json("https://api.github.com/repos/demo/repo/pulls/1")
+    assert payload["ok"] is True
 
 
 async def _fake_read_json(path: str) -> dict | list:

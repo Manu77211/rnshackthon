@@ -1,8 +1,9 @@
 import json
 import os
+import re
 from typing import Any
-from urllib import request
-from urllib.error import URLError
+from urllib import error, request
+from services.aws_deepseek_service import deepseek_json
 from services.diagnose_service import diagnose_error
 
 
@@ -58,15 +59,73 @@ def _openai_json(prompt: str) -> dict[str, Any] | None:
     try:
         with request.urlopen(req, timeout=20) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-    except (URLError, TimeoutError, json.JSONDecodeError):
+    except (error.URLError, TimeoutError, json.JSONDecodeError):
         return None
     content = body.get("choices", [{}])[0].get("message", {}).get("content", "")
-    if not content:
+    return _parse_json_dict(str(content))
+
+
+def _parse_json_dict(content: str) -> dict[str, Any] | None:
+    text = content.strip()
+    if not text:
         return None
     try:
-        return json.loads(content)
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else None
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+        return payload if isinstance(payload, dict) else None
     except json.JSONDecodeError:
         return None
+
+
+def _gemini_json(prompt: str) -> tuple[dict[str, Any] | None, str]:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        return None, ""
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+    }
+    req = request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+        method="POST",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (error.HTTPError, error.URLError, TimeoutError, json.JSONDecodeError):
+        return None, model
+    candidates = body.get("candidates", [])
+    if not isinstance(candidates, list) or not candidates:
+        return None, model
+    content = candidates[0].get("content", {}) if isinstance(candidates[0], dict) else {}
+    parts = content.get("parts", []) if isinstance(content, dict) else []
+    text = "\n".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+    return _parse_json_dict(text), model
+
+
+def _provider_json(prompt: str) -> tuple[dict[str, Any] | None, str]:
+    deepseek_payload, deepseek_error, deepseek_provider = deepseek_json(prompt)
+    if deepseek_payload:
+        return deepseek_payload, deepseek_provider or "aws-deepseek"
+    openai = _openai_json(prompt)
+    if openai:
+        return openai, "openai:gpt-4o-mini"
+    gemini, model = _gemini_json(prompt)
+    if gemini:
+        return gemini, f"gemini:{model}"
+    if deepseek_error and deepseek_error != "missing-gateway-config":
+        return None, f"fallback-template ({deepseek_error})"
+    return None, "fallback-template"
 
 
 async def generate_insights(
@@ -80,13 +139,12 @@ async def generate_insights(
     base = _fallback_summary(error_text, refs)
 
     prompt = _openai_prompt(error_text, refs)
-    llm = _openai_json(prompt)
+    llm, provider = _provider_json(prompt)
     if llm:
         summary = str(llm.get("summary", base["summary"]))
         root = str(llm.get("probable_root_cause", base["probable_root_cause"]))
         items = llm.get("action_items", base["action_items"])
         action_items = [str(item) for item in items][:3]
-        provider = "openai:gpt-4o-mini"
     else:
         summary = base["summary"]
         root = base["probable_root_cause"]

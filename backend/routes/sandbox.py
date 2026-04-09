@@ -4,8 +4,14 @@ from models.schemas import (
     SandboxFixDetailResponse,
     SandboxFixListResponse,
     SandboxFixRequest,
+    SandboxRunRequest,
+    SandboxRunResponse,
+    SandboxSuggestRequest,
+    SandboxSuggestResponse,
     SandboxFixSummary,
 )
+from services.sandbox_ai_service import suggest_fix_draft
+from services.sandbox_runtime_service import run_project_check
 from services.sandbox_service import get_fix_snapshot, list_fix_snapshots, save_fix_snapshot
 
 router = APIRouter(tags=["sandbox"])
@@ -43,3 +49,40 @@ async def fix_detail(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Snapshot not found") from exc
     return SandboxFixDetailResponse.model_validate(data)
+
+
+@router.post("/sandbox/run", response_model=SandboxRunResponse)
+async def sandbox_run(payload: SandboxRunRequest, org_id: str = Depends(get_org_id)) -> SandboxRunResponse:
+    try:
+        data = await run_project_check(
+            org_id=org_id,
+            project_id=payload.project_id,
+            command=payload.command,
+            timeout_sec=payload.timeout_sec,
+            include_ai_insights=payload.include_ai_insights,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Project source not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return SandboxRunResponse.model_validate(data)
+
+
+@router.post("/sandbox/suggest-fix", response_model=SandboxSuggestResponse)
+async def sandbox_suggest_fix(
+    payload: SandboxSuggestRequest,
+    org_id: str = Depends(get_org_id),
+) -> SandboxSuggestResponse:
+    try:
+        data = await suggest_fix_draft(
+            org_id=org_id,
+            project_id=payload.project_id,
+            file_path=payload.file_path,
+            instruction=payload.instruction,
+            error_text=payload.error_text,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Source file not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return SandboxSuggestResponse.model_validate(data)
