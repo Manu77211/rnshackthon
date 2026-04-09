@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { type CSSProperties, useEffect, useState } from "react";
 import { LoaderCircle } from "lucide-react";
 import { fetchProjectMap, findSimilarCode, type MapResponse, type SimilarityItem } from "@/lib/api";
 import { DependencyGraph } from "@/components/modules/dependency-graph";
@@ -13,6 +13,7 @@ export function MapPanel({ projectId }: MapPanelProps) {
   const [data, setData] = useState<MapResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [splitPercent, setSplitPercent] = useState(50);
   const [selectedFile, setSelectedFile] = useState("");
   const [selectedSnippet, setSelectedSnippet] = useState("");
   const [similarityLoading, setSimilarityLoading] = useState(false);
@@ -86,6 +87,18 @@ export function MapPanel({ projectId }: MapPanelProps) {
     }
   }
 
+  function handleSplitChange(nextValue: number): void {
+    if (!Number.isFinite(nextValue)) {
+      return;
+    }
+    const clamped = Math.max(35, Math.min(65, Math.round(nextValue)));
+    setSplitPercent(clamped);
+  }
+
+  const panelGridStyle = {
+    "--map-panel-cols": `${splitPercent}% ${100 - splitPercent}%`,
+  } as CSSProperties;
+
   if (!projectId) {
     return (
       <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -117,11 +130,35 @@ export function MapPanel({ projectId }: MapPanelProps) {
         Files: {data?.stats.totalFiles ?? 0} | Functions: {data?.stats.totalFunctions ?? 0} |
         Classes: {data?.stats.totalClasses ?? 0}
       </p>
-      <div className="mt-4 grid gap-3 xl:grid-cols-[2fr_1fr]">
+      <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700">
+        <span className="font-medium">Map vs Details</span>
+        <input
+          aria-label="Map and details split"
+          className="h-2 w-36 accent-slate-700"
+          max={65}
+          min={35}
+          onChange={(event) => handleSplitChange(Number(event.target.value))}
+          step={1}
+          type="range"
+          value={splitPercent}
+        />
+        <button
+          className="rounded-full border border-slate-300 bg-white px-2.5 py-1 text-xs text-slate-700"
+          onClick={() => setSplitPercent(50)}
+          type="button"
+        >
+          Equal Split
+        </button>
+        <span className="text-slate-500">Map {splitPercent}% | Details {100 - splitPercent}%</span>
+      </div>
+      <div
+        className="mt-4 grid gap-3 xl:grid-cols-(--map-panel-cols)"
+        style={panelGridStyle}
+      >
         <div className="min-w-0 rounded-xl border border-slate-200 bg-slate-50 p-2">
-          {data ? <DependencyGraph data={data} onSelectNode={setSelectedFile} /> : null}
+          {data ? <DependencyGraph key={projectId ?? "map"} data={data} onSelectNode={setSelectedFile} /> : null}
         </div>
-        <div className="space-y-3">
+        <div className="min-w-0 space-y-3">
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
             <p className="text-xs uppercase tracking-[0.2em] text-slate-500">File Details</p>
             <p className="mt-2 break-all font-medium text-slate-900">{selectedFile || "Select a node"}</p>
@@ -193,7 +230,7 @@ export function MapPanel({ projectId }: MapPanelProps) {
             </pre>
 
             <div className="mt-3 space-y-2">
-              <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Similar Functions (Phase 7)</p>
+              <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Similar Functions</p>
               {similarity.map((item) => (
                 <article key={`${item.file_path}-${item.chunk_name}`} className="rounded-lg border border-slate-200 bg-white p-2 text-xs">
                   <div className="flex items-center justify-between gap-2 text-slate-600">
